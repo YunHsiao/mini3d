@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <assert.h>
+#include <xmmintrin.h>
 
 #include <windows.h>
 #include <tchar.h>
@@ -11,9 +12,16 @@
 
 typedef unsigned int IUINT32;
 
-typedef struct { float m[4][4]; } matrix_t;
-typedef struct { float x, y, z, w; } vector_t;
+typedef __declspec(align(16)) struct { float m[4][4]; } matrix_t;
+typedef __declspec(align(16)) struct { float x, y, z, w; } vector_t;
 typedef vector_t point_t;
+
+#define CALL_CNT
+
+#ifdef CALL_CNT
+long vl = 0, vadd = 0, vsub = 0, vsca = 0, mtra = 0, mssca = 0, mrot = 0, mproj = 0, mlook = 0,
+vdot = 0, vcross = 0, vinterp = 0, vnor = 0, madd = 0, msub = 0, mmul = 0, msca = 0, mapp = 0, mid = 0, mzero = 0;
+#endif
 
 int CMID(int x, int min, int max) { return (x < min) ? min : ((x > max) ? max : x); }
 float saturate(float x) { return (x < 0.f) ? 0.f : ((x > 1.f) ? 1.f : x); }
@@ -24,44 +32,101 @@ float interp(float x1, float x2, float t) { return x1 + (x2 - x1) * t; }
 // | v |
 float vector_length(const vector_t *v) {
 	float sq = v->x * v->x + v->y * v->y + v->z * v->z;
+#ifdef CALL_CNT 
+	vl++;
+#endif
 	return (float)sqrt(sq);
 }
 
 // z = x + y
 vector_t* vector_add(vector_t *z, const vector_t *x, const vector_t *y) {
+	/**
+	__m128 a = _mm_load_ps((float*) x);
+	__m128 b = _mm_load_ps((float*) y);
+	_mm_store_ps((float*) z, _mm_add_ps(a, b));
+	#ifdef CALL_CNT
+	vadd++;
+	#endif
+	return z;
+	/**/
+#ifdef CALL_CNT 
+	vadd++;
+#endif
 	z->x = x->x + y->x;
 	z->y = x->y + y->y;
 	z->z = x->z + y->z;
 	z->w = 1.f;
 	return z;
+	/**/
 }
 
+void __stdcall sub_ps(__m128*, __m128*, __m128*);
 // z = x - y
 vector_t* vector_sub(vector_t *z, const vector_t *x, const vector_t *y) {
+	/**
+	__m128 a = _mm_load_ps((float*) x);
+	__m128 b = _mm_load_ps((float*) y);
+	__m128 r;
+	sub_ps(&r, &a, &b);
+	_mm_store_ps((float*) z, r);
+	return z;
+
+	/**
+	__m128 a = _mm_load_ps((float*) x);
+	__m128 b = _mm_load_ps((float*) y);
+	__m128 r;
+	__asm {
+	movaps xmm0, xmmword ptr [a]
+	movaps xmm1, xmmword ptr [b]
+	subps xmm0, xmm1
+	movaps xmmword ptr [r], xmm0
+	}
+	_mm_store_ps((float*) z, r);
+	return z;
+
+	/**
+	__m128 a = _mm_load_ps((float*) x);
+	__m128 b = _mm_load_ps((float*) y);
+	_mm_store_ps((float*) z, _mm_sub_ps(a, b));
+	return z;
+	/**/
+
+#ifdef CALL_CNT 
+	vsub++;
+#endif
 	z->x = x->x - y->x;
 	z->y = x->y - y->y;
 	z->z = x->z - y->z;
 	z->w = 1.f;
 	return z;
+	/**/
 }
 
 // z = x * t
 vector_t* vector_scale(vector_t *z, const vector_t *x, float t) {
+#ifdef CALL_CNT 
+	vsca++;
+#endif
 	z->x = x->x * t;
 	z->y = x->y * t;
 	z->z = x->z * t;
 	z->w = 1.f;
 	return z;
 }
-
 // 矢量点乘
 float vector_dotproduct(const vector_t *x, const vector_t *y) {
+#ifdef CALL_CNT 
+	vdot++;
+#endif
 	return x->x * y->x + x->y * y->y + x->z * y->z;
 }
 
 // 矢量叉乘
 vector_t* vector_crossproduct(vector_t *z, const vector_t *x, const vector_t *y) {
 	float m1, m2, m3;
+#ifdef CALL_CNT 
+	vcross++;
+#endif
 	m1 = x->y * y->z - x->z * y->y;
 	m2 = x->z * y->x - x->x * y->z;
 	m3 = x->x * y->y - x->y * y->x;
@@ -74,6 +139,9 @@ vector_t* vector_crossproduct(vector_t *z, const vector_t *x, const vector_t *y)
 
 // 矢量插值，t取值 [0, 1]
 vector_t* vector_interp(vector_t *z, const vector_t *x1, const vector_t *x2, float t) {
+#ifdef CALL_CNT 
+	vinterp++;
+#endif
 	z->x = interp(x1->x, x2->x, t);
 	z->y = interp(x1->y, x2->y, t);
 	z->z = interp(x1->z, x2->z, t);
@@ -84,6 +152,9 @@ vector_t* vector_interp(vector_t *z, const vector_t *x1, const vector_t *x2, flo
 // 矢量归一化
 vector_t* vector_normalize(vector_t *v) {
 	float length = vector_length(v);
+#ifdef CALL_CNT 
+	vnor++;
+#endif
 	if (length > 1e-6) {
 		float inv = 1.f / length;
 		v->x *= inv;
@@ -96,6 +167,9 @@ vector_t* vector_normalize(vector_t *v) {
 // c = a + b
 matrix_t* matrix_add(matrix_t *c, const matrix_t *a, const matrix_t *b) {
 	int i, j;
+#ifdef CALL_CNT 
+	madd++;
+#endif
 	for (i = 0; i < 4; i++) {
 		for (j = 0; j < 4; j++)
 			c->m[i][j] = a->m[i][j] + b->m[i][j];
@@ -106,6 +180,9 @@ matrix_t* matrix_add(matrix_t *c, const matrix_t *a, const matrix_t *b) {
 // c = a - b
 matrix_t* matrix_sub(matrix_t *c, const matrix_t *a, const matrix_t *b) {
 	int i, j;
+#ifdef CALL_CNT 
+	msub++;
+#endif
 	for (i = 0; i < 4; i++) {
 		for (j = 0; j < 4; j++)
 			c->m[i][j] = a->m[i][j] - b->m[i][j];
@@ -117,6 +194,9 @@ matrix_t* matrix_sub(matrix_t *c, const matrix_t *a, const matrix_t *b) {
 matrix_t* matrix_mul(matrix_t *c, const matrix_t *a, const matrix_t *b) {
 	matrix_t z;
 	int i, j;
+#ifdef CALL_CNT 
+	mmul++;
+#endif
 	for (i = 0; i < 4; i++) {
 		for (j = 0; j < 4; j++) {
 			z.m[j][i] = (a->m[j][0] * b->m[0][i]) +
@@ -132,6 +212,9 @@ matrix_t* matrix_mul(matrix_t *c, const matrix_t *a, const matrix_t *b) {
 // c = a * f
 matrix_t* matrix_scale(matrix_t *c, const matrix_t *a, float f) {
 	int i, j;
+#ifdef CALL_CNT 
+	msca++;
+#endif
 	for (i = 0; i < 4; i++) {
 		for (j = 0; j < 4; j++)
 			c->m[i][j] = a->m[i][j] * f;
@@ -139,17 +222,53 @@ matrix_t* matrix_scale(matrix_t *c, const matrix_t *a, float f) {
 	return c;
 }
 
+#define SHUFFLE_PARAM(x, y, z, w) \
+	((x) | (y << 2) | (z << 4) | (w << 6))
+#define _mm_repx_ps(v) \
+	_mm_shuffle_ps((v), (v), SHUFFLE_PARAM(0, 0, 0, 0))
+#define _mm_repy_ps(v) \
+	_mm_shuffle_ps((v), (v), SHUFFLE_PARAM(1, 1, 1, 1))
+#define _mm_repz_ps(v) \
+	_mm_shuffle_ps((v), (v), SHUFFLE_PARAM(2, 2, 2, 2))
+#define _mm_repw_ps(v) \
+	_mm_shuffle_ps((v), (v), SHUFFLE_PARAM(3, 3, 3, 3))
+#define _mm_madd_ps(a, b, c) \
+	_mm_add_ps(_mm_mul_ps((a), (b)), (c))
+
 // y = x * m
 vector_t* matrix_apply(vector_t *y, const vector_t *x, const matrix_t *m) {
+	/**/
+	__m128 a = _mm_load_ps((float*)x);
+	__m128 m0 = _mm_load_ps(m->m[0]);
+	__m128 m1 = _mm_load_ps(m->m[1]);
+	__m128 m2 = _mm_load_ps(m->m[2]);
+	__m128 m3 = _mm_load_ps(m->m[3]);
+	__m128 r = _mm_mul_ps(_mm_repx_ps(a), m0);
+	r = _mm_madd_ps(_mm_repy_ps(a), m1, r);
+	r = _mm_madd_ps(_mm_repz_ps(a), m2, r);
+	r = _mm_madd_ps(_mm_repw_ps(a), m3, r);
+	_mm_store_ps((float*)y, r);
+#ifdef CALL_CNT 
+	mapp++;
+#endif
+	return y;
+	/**
 	float X = x->x, Y = x->y, Z = x->z, W = x->w;
+	#ifdef CALL_CNT
+	mapp++;
+	#endif
 	y->x = X * m->m[0][0] + Y * m->m[1][0] + Z * m->m[2][0] + W * m->m[3][0];
 	y->y = X * m->m[0][1] + Y * m->m[1][1] + Z * m->m[2][1] + W * m->m[3][1];
 	y->z = X * m->m[0][2] + Y * m->m[1][2] + Z * m->m[2][2] + W * m->m[3][2];
 	y->w = X * m->m[0][3] + Y * m->m[1][3] + Z * m->m[2][3] + W * m->m[3][3];
 	return y;
+	/**/
 }
 
 matrix_t* matrix_set_identity(matrix_t *m) {
+#ifdef CALL_CNT 
+	mid++;
+#endif
 	m->m[0][0] = m->m[1][1] = m->m[2][2] = m->m[3][3] = 1.f;
 	m->m[0][1] = m->m[0][2] = m->m[0][3] = 0.f;
 	m->m[1][0] = m->m[1][2] = m->m[1][3] = 0.f;
@@ -159,6 +278,9 @@ matrix_t* matrix_set_identity(matrix_t *m) {
 }
 
 matrix_t* matrix_set_zero(matrix_t *m) {
+#ifdef CALL_CNT 
+	mzero++;
+#endif
 	m->m[0][0] = m->m[0][1] = m->m[0][2] = m->m[0][3] = 0.f;
 	m->m[1][0] = m->m[1][1] = m->m[1][2] = m->m[1][3] = 0.f;
 	m->m[2][0] = m->m[2][1] = m->m[2][2] = m->m[2][3] = 0.f;
@@ -168,6 +290,9 @@ matrix_t* matrix_set_zero(matrix_t *m) {
 
 // 平移变换
 matrix_t* matrix_set_translate(matrix_t *m, float x, float y, float z) {
+#ifdef CALL_CNT 
+	mtra++;
+#endif
 	matrix_set_identity(m);
 	m->m[3][0] = x;
 	m->m[3][1] = y;
@@ -177,6 +302,9 @@ matrix_t* matrix_set_translate(matrix_t *m, float x, float y, float z) {
 
 // 缩放变换
 matrix_t* matrix_set_scale(matrix_t *m, float x, float y, float z) {
+#ifdef CALL_CNT 
+	mssca++;
+#endif
 	matrix_set_identity(m);
 	m->m[0][0] = x;
 	m->m[1][1] = y;
@@ -189,6 +317,9 @@ matrix_t* matrix_set_rotate(matrix_t *m, float x, float y, float z, float theta)
 	float qsin = (float)sin(theta * .5f);
 	float w = (float)cos(theta * .5f);
 	vector_t vec = { x, y, z, 1.f };
+#ifdef CALL_CNT 
+	mrot++;
+#endif
 	vector_normalize(&vec);
 	x = vec.x * qsin;
 	y = vec.y * qsin;
@@ -211,7 +342,9 @@ matrix_t* matrix_set_rotate(matrix_t *m, float x, float y, float z, float theta)
 // 设置摄像机
 matrix_t* matrix_set_lookat(matrix_t *m, const vector_t *eye, const vector_t *at, const vector_t *up) {
 	vector_t xaxis, yaxis, zaxis;
-
+#ifdef CALL_CNT 
+	mlook++;
+#endif
 	vector_sub(&zaxis, at, eye);
 	vector_normalize(&zaxis);
 	vector_crossproduct(&xaxis, up, &zaxis);
@@ -241,6 +374,9 @@ matrix_t* matrix_set_lookat(matrix_t *m, const vector_t *eye, const vector_t *at
 // D3DXMatrixPerspectiveFovLH
 matrix_t* matrix_set_perspective(matrix_t *m, float fovy, float aspect, float zn, float zf) {
 	float fax = 1.f / (float)tan(fovy * .5f);
+#ifdef CALL_CNT 
+	mproj++;
+#endif
 	matrix_set_zero(m);
 	m->m[0][0] = (float)(fax / aspect);
 	m->m[1][1] = (float)(fax);
@@ -286,11 +422,11 @@ int transform_check_cvv(const vector_t *v) {
 	float w = v->w;
 	int check = 0;
 	if (v->z < 0.f) check |= 1;
-	if (v->z > w) check |= 2;
+	if (v->z >  w) check |= 2;
 	if (v->x < -w) check |= 4;
-	if (v->x > w) check |= 8;
+	if (v->x >  w) check |= 8;
 	if (v->y < -w) check |= 16;
-	if (v->y > w) check |= 32;
+	if (v->y >  w) check |= 32;
 	return check;
 }
 
@@ -302,7 +438,7 @@ void transform_homogenize(const transform_t *ts, vector_t *y, const vector_t *x,
 	y->w = 1.f;
 }
 
-typedef struct { float r, g, b; } color_t;
+typedef __declspec(align(16)) struct { float r, g, b; } color_t;
 typedef struct { float u, v; } texcoord_t;
 typedef struct { point_t pos; vector_t normal; texcoord_t tc; color_t color; float rhw; } vertex_t;
 
@@ -326,15 +462,37 @@ void vertex_rhw_init(vertex_t *v) {
 	v->color.b *= rhw;
 }
 
-void vertex_interp(vertex_t *y, const vertex_t *x1, const vertex_t *x2, float t) {
-	vector_interp(&y->pos, &x1->pos, &x2->pos, t);
-	vector_interp(&y->normal, &x1->normal, &x2->normal, t);
-	y->tc.u = interp(x1->tc.u, x2->tc.u, t);
-	y->tc.v = interp(x1->tc.v, x2->tc.v, t);
-	y->color.r = interp(x1->color.r, x2->color.r, t);
-	y->color.g = interp(x1->color.g, x2->color.g, t);
-	y->color.b = interp(x1->color.b, x2->color.b, t);
-	y->rhw = interp(x1->rhw, x2->rhw, t);
+void vertex_interp(vertex_t *y, const vertex_t *x1, const vertex_t *x2, float tt) {
+	/**/
+	__m128 v1, v2, n1, n2, t1, t2, c1, c2, r1, r2, p, v, n, t, c, r;
+	y->pos.x = tt;
+	v1 = _mm_load_ps((float*)&x1->pos); v2 = _mm_load_ps((float*)&x2->pos);
+	n1 = _mm_load_ps((float*)&x1->normal); n2 = _mm_load_ps((float*)&x2->normal);
+	t1 = _mm_load_ps((float*)&x1->tc); t2 = _mm_load_ps((float*)&x2->tc);
+	c1 = _mm_load_ps((float*)&x1->color); c2 = _mm_load_ps((float*)&x2->color);
+	r1 = _mm_load_ss((float*)&x1->rhw); r2 = _mm_load_ss((float*)&x2->rhw);
+	p = _mm_repx_ps(_mm_load_ss((float*)&y->pos));
+
+	v = _mm_add_ps(v1, _mm_mul_ps(p, _mm_sub_ps(v2, v1)));
+	n = _mm_add_ps(n1, _mm_mul_ps(p, _mm_sub_ps(n2, n1)));
+	t = _mm_add_ps(t1, _mm_mul_ps(p, _mm_sub_ps(t2, t1)));
+	c = _mm_add_ps(c1, _mm_mul_ps(p, _mm_sub_ps(c2, c1)));
+	r = _mm_add_ss(r1, _mm_mul_ss(p, _mm_sub_ss(r2, r1)));
+	_mm_store_ps((float*)&y->pos, v);
+	_mm_store_ps((float*)&y->normal, n);
+	_mm_store_ps((float*)&y->tc, t);
+	_mm_store_ps((float*)&y->color, c);
+	_mm_store_ss((float*)&y->rhw, r);
+	/**
+	vector_interp(&y->pos, &x1->pos, &x2->pos, tt);
+	vector_interp(&y->normal, &x1->normal, &x2->normal, tt);
+	y->tc.u = interp(x1->tc.u, x2->tc.u, tt);
+	y->tc.v = interp(x1->tc.v, x2->tc.v, tt);
+	y->color.r = interp(x1->color.r, x2->color.r, tt);
+	y->color.g = interp(x1->color.g, x2->color.g, tt);
+	y->color.b = interp(x1->color.b, x2->color.b, tt);
+	y->rhw = interp(x1->rhw, x2->rhw, tt);
+	/**/
 }
 
 void vertex_division(vertex_t *y, const vertex_t *x1, const vertex_t *x2, float w) {
@@ -852,7 +1010,7 @@ int screen_init(int w, int h, const TCHAR *title) {
 	SetTextColor(screen_dc, RGB(0, 0, 0));
 	SetBkMode(screen_dc, TRANSPARENT);
 
-	AdjustWindowRect(&rect, GetWindowLongPtr(screen_handle, GWL_STYLE), 0);
+	AdjustWindowRect(&rect, (DWORD)GetWindowLongPtr(screen_handle, GWL_STYLE), 0);
 	wx = rect.right - rect.left;
 	wy = rect.bottom - rect.top;
 	sx = (GetSystemMetrics(SM_CXSCREEN) - wx) / 2;
@@ -1057,7 +1215,7 @@ void draw_knot(device_t *device, int oldRS) {
 }
 
 void write_FPS() {
-	static char str[4];
+	static char str[4], debug[512];
 	static unsigned long last = 0, current = 0, cnt = 0;
 	current = timeGetTime();
 	if (current - last >= 1000) {
@@ -1065,8 +1223,19 @@ void write_FPS() {
 		last = current; cnt = 0;
 	}
 	else cnt++;
+#ifdef CALL_CNT 
+	sprintf_s(debug, 512, "vl %d\nvadd %d\nvsub %d\nvsca %d\nvdot %d\nvcross %d\n\
+vinterp %d\nvnor %d\nmadd %d\nmsub %d\nmmul %d\nmsca %d\nmapp %d\nmid %d\nmzero %d\n\
+mtra %d\nmssca %d\nmrot %d\nmproj %d\nmlook %d\n", vl, vadd, vsub, vsca, vdot, vcross,
+vinterp, vnor, madd, msub, mmul, msca, mapp, mid, mzero, mtra, mssca, mrot, mproj, mlook);
+	vl = vadd = vsub = vsca = vdot = vcross = vinterp = vnor = madd = msub =
+		mmul = msca = mapp = mid = mzero = mtra = mssca = mrot = mproj = mlook = 0;
+#endif
 	SelectObject(screen_dc, screen_font);
-	DrawTextA(screen_dc, str, strlen(str), &screen_rect, DT_RIGHT);
+#ifdef CALL_CNT 
+	DrawTextA(screen_dc, debug, (int)strlen(debug), &screen_rect, DT_LEFT);
+#endif
+	DrawTextA(screen_dc, str, (int)strlen(str), &screen_rect, DT_RIGHT);
 	SelectObject(screen_dc, screen_hb);
 }
 
