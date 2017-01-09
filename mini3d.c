@@ -606,6 +606,7 @@ typedef struct {
 	matrix_t world;         // 世界坐标变换
 	matrix_t view;          // 摄影机坐标变换
 	matrix_t projection;    // 投影变换
+	matrix_t light;			// 世界-光源空间变换
 	matrix_t transform;     // transform = world * view * projection
 	float w, h;             // 屏幕大小
 }	transform_t;
@@ -629,218 +630,255 @@ void transform_init(transform_t *ts, int width, int height) {
 }
 
 // 检查齐次坐标同 cvv 的边界用于视锥裁剪
-int transform_check_cvv(const vector_t *v) {
+int transform_check_cvv(const float *v) {
 	int check = 0;
-	if (v->z <  0.f) check |= 1;
-	if (v->z >  1.f) check |= 2;
-	if (v->x < -1.f) check |= 4;
-	if (v->x >  1.f) check |= 8;
-	if (v->y < -1.f) check |= 16;
-	if (v->y >  1.f) check |= 32;
+	if (v[2] < 0.f) check |= 1;
+	if (v[2] > 1.f) check |= 2;
+	if (v[0] < -1.f) check |= 4;
+	if (v[0] > 1.f) check |= 8;
+	if (v[1] < -1.f) check |= 16;
+	if (v[1] > 1.f) check |= 32;
 	return check;
 }
 
 // 转换到屏幕坐标系
-void transform_to_screen(const transform_t *ts, vector_t *y, const vector_t *x) {
-	y->x = (x->x + 1.f) * ts->w * .5f;
-	y->y = (1.f - x->y) * ts->h * .5f;
-	y->w = 1.f;
+void transform_to_screen(const transform_t* ts, float* y, const float* x) {
+	y[0] = (x[0] + 1.f) * ts->w * .5f;
+	y[1] = (1.f - x[1]) * ts->h * .5f;
+	y[3] = 1.f;
 }
 
 typedef struct { float r, g, b; } color_t;
 typedef __declspec(align(16)) struct { float u, v; } texcoord_t;
-typedef struct { point_t pos; vector_t normal; point_t posW; texcoord_t tc; color_t color; float rhw; } vertex_t;
 
-typedef struct { vertex_t v, v1, v2; } edge_t;
+#define VL 20
+int vl = VL, dst_size = sizeof(float) * VL, src_size = sizeof(float) * VL;
+typedef struct { point_t pos; vector_t normal; texcoord_t tc; color_t color; } vertex_t;
+typedef struct { __declspec(align(16)) float v[VL], v1[VL], v2[VL]; } edge_t;
 typedef struct { float top, bottom; edge_t left, right; } trapezoid_t;
-typedef struct { vertex_t v, step; int x, y, w; } scanline_t;
+typedef struct { __declspec(align(16)) float v[VL], step[VL]; int x, y, w; } scanline_t;
 
-// 转换到齐次裁剪空间
-void transform_apply(const transform_t* ts, vertex_t* y, const vector_t *x) {
-	__m128 p, t, c, w;
-	float rhw;
-	matrix_apply(&y->pos, x, &ts->transform);
-	matrix_apply(&y->posW, x, &ts->world);
-	rhw = 1.f / y->pos.w;
-	/**/
-	p = _mm_load_ps((float*)&y->pos);
-	t = _mm_load_ps((float*)&y->tc);
-	c = _mm_load_ps((float*)&y->color);
-	w = _mm_repx_ps(_mm_load_ss(&rhw));
+//// 转换到齐次裁剪空间
+//void transform_apply(const transform_t* ts, vertex_t* y, const vector_t *x) {
+//	__m128 p, t, c, w;
+//	float rhw;
+//	matrix_apply(&y->pos, x, &ts->transform);
+//	matrix_apply(&y->posW, x, &ts->world);
+//	rhw = 1.f / y->pos.w;
+//	/**/
+//	p = _mm_load_ps((float*)&y->pos);
+//	t = _mm_load_ps((float*)&y->tc);
+//	c = _mm_load_ps((float*)&y->color);
+//	w = _mm_repx_ps(_mm_load_ss(&rhw));
+//
+//	p = _mm_mul_ps(p, w);
+//	t = _mm_mul_ps(t, w);
+//	c = _mm_mul_ps(c, w);
+//
+//	_mm_store_ps((float*)&y->pos, p);
+//	_mm_store_ps((float*)&y->tc, t);
+//	_mm_store_ps((float*)&y->color, c);
+//	/**
+//	y->pos.x *= y->rhw;
+//	y->pos.y *= y->rhw;
+//	y->pos.z *= y->rhw;
+//	y->pos.w = 1.f;
+//	y->tc.u *= y->rhw;
+//	y->tc.v *= y->rhw;
+//	y->color.r *= y->rhw;
+//	y->color.g *= y->rhw;
+//	y->color.b *= y->rhw;
+//	/**/
+//}
+//
+//void vertex_interp(vertex_t *y, const vertex_t *x1, const vertex_t *x2, float tt) {
+//	/**/
+//	__m128 v1, v2, w1, w2, t1, t2, c1, c2, p, v, w, t, c;
+//	v1 = _mm_load_ps((float*)&x1->pos); v2 = _mm_load_ps((float*)&x2->pos);
+//	w1 = _mm_load_ps((float*)&x1->posW); w2 = _mm_load_ps((float*)&x2->posW);
+//	t1 = _mm_load_ps((float*)&x1->tc); t2 = _mm_load_ps((float*)&x2->tc);
+//	c1 = _mm_load_ps((float*)&x1->color); c2 = _mm_load_ps((float*)&x2->color);
+//	p = _mm_repx_ps(_mm_load_ss(&tt));
+//
+//	v = _mm_add_ps(v1, _mm_mul_ps(p, _mm_sub_ps(v2, v1)));
+//	w = _mm_add_ps(w1, _mm_mul_ps(p, _mm_sub_ps(w2, w1)));
+//	t = _mm_add_ps(t1, _mm_mul_ps(p, _mm_sub_ps(t2, t1)));
+//	c = _mm_add_ps(c1, _mm_mul_ps(p, _mm_sub_ps(c2, c1)));
+//	_mm_store_ps((float*)&y->pos, v);
+//	_mm_store_ps((float*)&y->posW, w);
+//	_mm_store_ps((float*)&y->tc, t);
+//	_mm_store_ps((float*)&y->color, c);
+//#ifdef NORMAL_INTERP
+//	{
+//		__m128 n1, n2, n;
+//		n1 = _mm_load_ps((float*) &x1->normal); n2 = _mm_load_ps((float*) &x2->normal);
+//		n = _mm_add_ps(n1, _mm_mul_ps(p, _mm_sub_ps(n2, n1)));
+//		_mm_store_ps((float*) &y->normal, n);
+//	}
+//#else
+//	y->normal = x1->normal;
+//#endif
+//
+//	/**
+//	vector_interp(&y->pos, &x1->pos, &x2->pos, tt);
+//	#ifdef NORMAL_INTERP
+//	vector_interp(&y->normal, &x1->normal, &x2->normal, tt);
+//	#else
+//	y->normal = x1->normal;
+//	#endif
+//	y->tc.u = interp(x1->tc.u, x2->tc.u, tt);
+//	y->tc.v = interp(x1->tc.v, x2->tc.v, tt);
+//	y->color.r = interp(x1->color.r, x2->color.r, tt);
+//	y->color.g = interp(x1->color.g, x2->color.g, tt);
+//	y->color.b = interp(x1->color.b, x2->color.b, tt);
+//	y->rhw = interp(x1->rhw, x2->rhw, tt);
+//	/**/
+//}
+//
+//void vertex_division(vertex_t *y, const vertex_t *x1, const vertex_t *x2, float w) {
+//	float inv = 1.f / w;
+//	y->pos.x = (x2->pos.x - x1->pos.x) * inv;
+//	y->pos.y = (x2->pos.y - x1->pos.y) * inv;
+//	y->pos.z = (x2->pos.z - x1->pos.z) * inv;
+//	y->pos.w = (x2->pos.w - x1->pos.w) * inv;
+//	y->posW.x = (x2->posW.x - x1->posW.x) * inv;
+//	y->posW.y = (x2->posW.y - x1->posW.y) * inv;
+//	y->posW.z = (x2->posW.z - x1->posW.z) * inv;
+//	y->posW.w = (x2->posW.w - x1->posW.w) * inv;
+//#ifdef NORMAL_INTERP
+//	y->normal.x = (x2->normal.x - x1->normal.x) * inv;
+//	y->normal.y = (x2->normal.y - x1->normal.y) * inv;
+//	y->normal.z = (x2->normal.z - x1->normal.z) * inv;
+//	y->normal.w = (x2->normal.w - x1->normal.w) * inv;
+//#endif
+//	y->tc.u = (x2->tc.u - x1->tc.u) * inv;
+//	y->tc.v = (x2->tc.v - x1->tc.v) * inv;
+//	y->color.r = (x2->color.r - x1->color.r) * inv;
+//	y->color.g = (x2->color.g - x1->color.g) * inv;
+//	y->color.b = (x2->color.b - x1->color.b) * inv;
+//	y->rhw = (x2->rhw - x1->rhw) * inv;
+//}
+//
+//void vertex_add(vertex_t *y, const vertex_t *x) {
+//	y->pos.x += x->pos.x;
+//	y->pos.y += x->pos.y;
+//	y->pos.z += x->pos.z;
+//	y->pos.w += x->pos.w;
+//	y->posW.x += x->posW.x;
+//	y->posW.y += x->posW.y;
+//	y->posW.z += x->posW.z;
+//	y->posW.w += x->posW.w;
+//#ifdef NORMAL_INTERP
+//	y->normal.x += x->normal.x;
+//	y->normal.y += x->normal.y;
+//	y->normal.z += x->normal.z;
+//	y->normal.w += x->normal.w;
+//#endif
+//	y->rhw += x->rhw;
+//	y->tc.u += x->tc.u;
+//	y->tc.v += x->tc.v;
+//	y->color.r += x->color.r;
+//	y->color.g += x->color.g;
+//	y->color.b += x->color.b;
+//}
 
-	p = _mm_mul_ps(p, w);
-	t = _mm_mul_ps(t, w);
-	c = _mm_mul_ps(c, w);
-
-	_mm_store_ps((float*)&y->pos, p);
-	_mm_store_ps((float*)&y->tc, t);
-	_mm_store_ps((float*)&y->color, c);
-	/**
-	y->pos.x *= y->rhw;
-	y->pos.y *= y->rhw;
-	y->pos.z *= y->rhw;
-	y->pos.w = 1.f;
-	y->tc.u *= y->rhw;
-	y->tc.v *= y->rhw;
-	y->color.r *= y->rhw;
-	y->color.g *= y->rhw;
-	y->color.b *= y->rhw;
-	/**/
-}
-
-void vertex_interp(vertex_t *y, const vertex_t *x1, const vertex_t *x2, float tt) {
-	/**/
-	__m128 v1, v2, w1, w2, t1, t2, c1, c2, p, v, w, t, c;
-	v1 = _mm_load_ps((float*)&x1->pos); v2 = _mm_load_ps((float*)&x2->pos);
-	w1 = _mm_load_ps((float*)&x1->posW); w2 = _mm_load_ps((float*)&x2->posW);
-	t1 = _mm_load_ps((float*)&x1->tc); t2 = _mm_load_ps((float*)&x2->tc);
-	c1 = _mm_load_ps((float*)&x1->color); c2 = _mm_load_ps((float*)&x2->color);
-	p = _mm_repx_ps(_mm_load_ss(&tt));
-
-	v = _mm_add_ps(v1, _mm_mul_ps(p, _mm_sub_ps(v2, v1)));
-	w = _mm_add_ps(w1, _mm_mul_ps(p, _mm_sub_ps(w2, w1)));
-	t = _mm_add_ps(t1, _mm_mul_ps(p, _mm_sub_ps(t2, t1)));
-	c = _mm_add_ps(c1, _mm_mul_ps(p, _mm_sub_ps(c2, c1)));
-	_mm_store_ps((float*)&y->pos, v);
-	_mm_store_ps((float*)&y->posW, w);
-	_mm_store_ps((float*)&y->tc, t);
-	_mm_store_ps((float*)&y->color, c);
-#ifdef NORMAL_INTERP
-	{
-		__m128 n1, n2, n;
-		n1 = _mm_load_ps((float*)&x1->normal); n2 = _mm_load_ps((float*)&x2->normal);
-		n = _mm_add_ps(n1, _mm_mul_ps(p, _mm_sub_ps(n2, n1)));
-		_mm_store_ps((float*)&y->normal, n);
+void vertex_interp(float* y, const float* x1, const float* x2, float t) {
+	__m128 v1, v2, v, p;
+	int i;
+	p = _mm_repx_ps(_mm_load_ss(&t));
+	for (i = 0; i < vl; i += 4) {
+		v1 = _mm_load_ps(&x1[i]);
+		v2 = _mm_load_ps(&x2[i]);
+		v = _mm_add_ps(v1, _mm_mul_ps(p, _mm_sub_ps(v2, v1)));
+		_mm_store_ps(&y[i], v);
 	}
-#else
-	y->normal = x1->normal;
-#endif
-
-
-	/**
-	vector_interp(&y->pos, &x1->pos, &x2->pos, tt);
-	#ifdef NORMAL_INTERP
-	vector_interp(&y->normal, &x1->normal, &x2->normal, tt);
-	#else
-	y->normal = x1->normal;
-	#endif
-	y->tc.u = interp(x1->tc.u, x2->tc.u, tt);
-	y->tc.v = interp(x1->tc.v, x2->tc.v, tt);
-	y->color.r = interp(x1->color.r, x2->color.r, tt);
-	y->color.g = interp(x1->color.g, x2->color.g, tt);
-	y->color.b = interp(x1->color.b, x2->color.b, tt);
-	y->rhw = interp(x1->rhw, x2->rhw, tt);
-	/**/
 }
 
-void vertex_division(vertex_t *y, const vertex_t *x1, const vertex_t *x2, float w) {
+void vertex_division(float* y, const float* x1, const float* x2, float w) {
 	float inv = 1.f / w;
-	y->pos.x = (x2->pos.x - x1->pos.x) * inv;
-	y->pos.y = (x2->pos.y - x1->pos.y) * inv;
-	y->pos.z = (x2->pos.z - x1->pos.z) * inv;
-	y->pos.w = (x2->pos.w - x1->pos.w) * inv;
-	y->posW.x = (x2->posW.x - x1->posW.x) * inv;
-	y->posW.y = (x2->posW.y - x1->posW.y) * inv;
-	y->posW.z = (x2->posW.z - x1->posW.z) * inv;
-	y->posW.w = (x2->posW.w - x1->posW.w) * inv;
-#ifdef NORMAL_INTERP
-	y->normal.x = (x2->normal.x - x1->normal.x) * inv;
-	y->normal.y = (x2->normal.y - x1->normal.y) * inv;
-	y->normal.z = (x2->normal.z - x1->normal.z) * inv;
-	y->normal.w = (x2->normal.w - x1->normal.w) * inv;
-#endif
-	y->tc.u = (x2->tc.u - x1->tc.u) * inv;
-	y->tc.v = (x2->tc.v - x1->tc.v) * inv;
-	y->color.r = (x2->color.r - x1->color.r) * inv;
-	y->color.g = (x2->color.g - x1->color.g) * inv;
-	y->color.b = (x2->color.b - x1->color.b) * inv;
-	y->rhw = (x2->rhw - x1->rhw) * inv;
+	__m128 v1, v2, v, p;
+	int i;
+	p = _mm_repx_ps(_mm_load_ss(&inv));
+	for (i = 0; i < vl; i += 4) {
+		v1 = _mm_load_ps(&x1[i]);
+		v2 = _mm_load_ps(&x2[i]);
+		v = _mm_mul_ps(p, _mm_sub_ps(v2, v1));
+		_mm_store_ps(&y[i], v);
+	}
 }
 
-void vertex_add(vertex_t *y, const vertex_t *x) {
-	y->pos.x += x->pos.x;
-	y->pos.y += x->pos.y;
-	y->pos.z += x->pos.z;
-	y->pos.w += x->pos.w;
-	y->posW.x += x->posW.x;
-	y->posW.y += x->posW.y;
-	y->posW.z += x->posW.z;
-	y->posW.w += x->posW.w;
-#ifdef NORMAL_INTERP
-	y->normal.x += x->normal.x;
-	y->normal.y += x->normal.y;
-	y->normal.z += x->normal.z;
-	y->normal.w += x->normal.w;
-#endif
-	y->rhw += x->rhw;
-	y->tc.u += x->tc.u;
-	y->tc.v += x->tc.v;
-	y->color.r += x->color.r;
-	y->color.g += x->color.g;
-	y->color.b += x->color.b;
+void vertex_add(float* y, const float* x) {
+	__m128 v1, v2, v;
+	int i;
+	for (i = 0; i < vl; i += 4) {
+		v1 = _mm_load_ps(&x[i]);
+		v2 = _mm_load_ps(&y[i]);
+		v = _mm_add_ps(v1, v2);
+		_mm_store_ps(&y[i], v);
+	}
 }
 
 // 根据三角形生成 0-2 个梯形，并且返回合法梯形的数量
-int trapezoid_init_triangle(trapezoid_t *trap, const vertex_t *p1,
-	const vertex_t *p2, const vertex_t *p3) {
-	const vertex_t *p;
+int trapezoid_init_triangle(trapezoid_t *trap, const float* p1,
+	const float* p2, const float* p3) {
 	float k, x;
+	const float* p;
 
-	if (p1->pos.y > p2->pos.y) p = p1, p1 = p2, p2 = p;
-	if (p1->pos.y > p3->pos.y) p = p1, p1 = p3, p3 = p;
-	if (p2->pos.y > p3->pos.y) p = p2, p2 = p3, p3 = p;
-	if (p1->pos.y == p2->pos.y && p1->pos.y == p3->pos.y) return 0;
-	if (p1->pos.x == p2->pos.x && p1->pos.x == p3->pos.x) return 0;
+	if (p1[1] > p2[1]) p = p1, p1 = p2, p2 = p;
+	if (p1[1] > p3[1]) p = p1, p1 = p3, p3 = p;
+	if (p2[1] > p3[1]) p = p2, p2 = p3, p3 = p;
+	if (p1[1] == p2[1] && p1[1] == p3[1]) return 0;
+	if (p1[0] == p2[0] && p1[0] == p3[0]) return 0;
 
-	if (p1->pos.y == p2->pos.y) { // down
-		if (p1->pos.x > p2->pos.x) p = p1, p1 = p2, p2 = p;
-		trap[0].top = p1->pos.y;
-		trap[0].bottom = p3->pos.y;
-		trap[0].left.v1 = *p1;
-		trap[0].left.v2 = *p3;
-		trap[0].right.v1 = *p2;
-		trap[0].right.v2 = *p3;
+	if (p1[1] == p2[1]) { // down
+		if (p1[0] > p2[0]) p = p1, p1 = p2, p2 = p;
+		trap[0].top = p1[1];
+		trap[0].bottom = p3[1];
+		memcpy_s(trap[0].left.v1, dst_size, p1, src_size);
+		memcpy_s(trap[0].left.v2, dst_size, p3, src_size);
+		memcpy_s(trap[0].right.v1, dst_size, p2, src_size);
+		memcpy_s(trap[0].right.v2, dst_size, p3, src_size);
 		return (trap[0].top < trap[0].bottom) ? 1 : 0;
 	}
 
-	if (p2->pos.y == p3->pos.y) { // up
-		if (p2->pos.x > p3->pos.x) p = p2, p2 = p3, p3 = p;
-		trap[0].top = p1->pos.y;
-		trap[0].bottom = p3->pos.y;
-		trap[0].left.v1 = *p1;
-		trap[0].left.v2 = *p2;
-		trap[0].right.v1 = *p1;
-		trap[0].right.v2 = *p3;
+	if (p2[1] == p3[1]) { // up
+		if (p2[0] > p3[0]) p = p2, p2 = p3, p3 = p;
+		trap[0].top = p1[1];
+		trap[0].bottom = p3[1];
+		memcpy_s(trap[0].left.v1, dst_size, p1, src_size);
+		memcpy_s(trap[0].left.v2, dst_size, p2, src_size);
+		memcpy_s(trap[0].right.v1, dst_size, p1, src_size);
+		memcpy_s(trap[0].right.v2, dst_size, p3, src_size);
 		return (trap[0].top < trap[0].bottom) ? 1 : 0;
 	}
 
-	trap[0].top = p1->pos.y;
-	trap[0].bottom = p2->pos.y;
-	trap[1].top = p2->pos.y;
-	trap[1].bottom = p3->pos.y;
+	trap[0].top = p1[1];
+	trap[0].bottom = p2[1];
+	trap[1].top = p2[1];
+	trap[1].bottom = p3[1];
 
-	k = (p3->pos.y - p1->pos.y) / (p2->pos.y - p1->pos.y);
-	x = p1->pos.x + (p2->pos.x - p1->pos.x) * k;
+	k = (p3[1] - p1[1]) / (p2[1] - p1[1]);
+	x = p1[0] + (p2[0] - p1[0]) * k;
 
-	if (x <= p3->pos.x) { // left
-		trap[0].left.v1 = *p1;
-		trap[0].left.v2 = *p2;
-		trap[0].right.v1 = *p1;
-		trap[0].right.v2 = *p3;
-		trap[1].left.v1 = *p2;
-		trap[1].left.v2 = *p3;
-		trap[1].right.v1 = *p1;
-		trap[1].right.v2 = *p3;
+	if (x <= p3[0]) { // left
+		memcpy_s(trap[0].left.v1, dst_size, p1, src_size);
+		memcpy_s(trap[0].left.v2, dst_size, p2, src_size);
+		memcpy_s(trap[0].right.v1, dst_size, p1, src_size);
+		memcpy_s(trap[0].right.v2, dst_size, p3, src_size);
+		memcpy_s(trap[1].left.v1, dst_size, p2, src_size);
+		memcpy_s(trap[1].left.v2, dst_size, p3, src_size);
+		memcpy_s(trap[1].right.v1, dst_size, p1, src_size);
+		memcpy_s(trap[1].right.v2, dst_size, p3, src_size);
 	}
 	else { // right
-		trap[0].left.v1 = *p1;
-		trap[0].left.v2 = *p3;
-		trap[0].right.v1 = *p1;
-		trap[0].right.v2 = *p2;
-		trap[1].left.v1 = *p1;
-		trap[1].left.v2 = *p3;
-		trap[1].right.v1 = *p2;
-		trap[1].right.v2 = *p3;
+		memcpy_s(trap[0].left.v1, dst_size, p1, src_size);
+		memcpy_s(trap[0].left.v2, dst_size, p3, src_size);
+		memcpy_s(trap[0].right.v1, dst_size, p1, src_size);
+		memcpy_s(trap[0].right.v2, dst_size, p2, src_size);
+		memcpy_s(trap[1].left.v1, dst_size, p1, src_size);
+		memcpy_s(trap[1].left.v2, dst_size, p3, src_size);
+		memcpy_s(trap[1].right.v1, dst_size, p2, src_size);
+		memcpy_s(trap[1].right.v2, dst_size, p3, src_size);
 	}
 
 	return 2;
@@ -848,23 +886,23 @@ int trapezoid_init_triangle(trapezoid_t *trap, const vertex_t *p1,
 
 // 按照 Y 坐标计算出左右两条边纵坐标等于 Y 的顶点
 void trapezoid_edge_interp(trapezoid_t *trap, float y) {
-	float s1 = trap->left.v2.pos.y - trap->left.v1.pos.y;
-	float s2 = trap->right.v2.pos.y - trap->right.v1.pos.y;
-	float t1 = (y - trap->left.v1.pos.y) / s1;
-	float t2 = (y - trap->right.v1.pos.y) / s2;
-	vertex_interp(&trap->left.v, &trap->left.v1, &trap->left.v2, t1);
-	vertex_interp(&trap->right.v, &trap->right.v1, &trap->right.v2, t2);
+	float s1 = trap->left.v2[1] - trap->left.v1[1];
+	float s2 = trap->right.v2[1] - trap->right.v1[1];
+	float t1 = (y - trap->left.v1[1]) / s1;
+	float t2 = (y - trap->right.v1[1]) / s2;
+	vertex_interp(trap->left.v, trap->left.v1, trap->left.v2, t1);
+	vertex_interp(trap->right.v, trap->right.v1, trap->right.v2, t2);
 }
 
 // 根据左右两边的端点，初始化计算出扫描线的起点和步长
 void trapezoid_init_scan_line(const trapezoid_t *trap, scanline_t *scanline, int y) {
-	float width = trap->right.v.pos.x - trap->left.v.pos.x;
-	scanline->x = (int)(trap->left.v.pos.x + .5f);
-	scanline->w = (int)(trap->right.v.pos.x + .5f) - scanline->x;
+	float width = trap->right.v[0] - trap->left.v[0];
+	scanline->x = (int)(trap->left.v[0] + .5f);
+	scanline->w = (int)(trap->right.v[0] + .5f) - scanline->x;
 	scanline->y = y;
-	scanline->v = trap->left.v;
-	if (trap->left.v.pos.x >= trap->right.v.pos.x) scanline->w = 0;
-	vertex_division(&scanline->step, &trap->left.v, &trap->right.v, width);
+	memcpy_s(scanline->v, dst_size, trap->left.v, src_size);
+	if (trap->left.v[0] >= trap->right.v[0]) scanline->w = 0;
+	vertex_division(scanline->step, trap->left.v, trap->right.v, width);
 }
 
 typedef struct {
@@ -882,7 +920,7 @@ typedef struct {
 	IUINT32 background;         // 背景颜色
 	IUINT32 foreground;         // 线框颜色
 	vector_t light_dir;			// 平行光方向
-	color_t ambient;			// 环境光颜色
+	__m128 ambient;				// 环境光颜色
 }	device_t;
 
 #define RENDER_STATE_POINT	        1		// 渲染点阵
@@ -890,7 +928,13 @@ typedef struct {
 #define RENDER_STATE_COLOR	        4		// 渲染颜色
 #define RENDER_STATE_TEXTURE        8		// 渲染纹理
 
-char shadowmap_test(const point_t* p);
+char shadowmap_test(device_t* device, const point_t* p);
+
+void update_light_matrix(device_t* device) {
+	vector_t eye = { -4.f, -4.f, 0.f, 1.f }, at, up = { 0.f, 1.f, 0.f, 0.f };
+	vector_add(&at, &device->light_dir, &eye);
+	matrix_set_lookat(&device->transform.light, &eye, &at, &up);
+}
 
 // 设备初始化，fb为外部帧缓存，非 NULL 将引用外部帧缓存（每行 4字节对齐）
 void device_init(device_t *device, int width, int height, void *fb) {
@@ -898,6 +942,7 @@ void device_init(device_t *device, int width, int height, void *fb) {
 	char *ptr = (char*)malloc(need + 64);
 	char *framebuf, *zbuf;
 	int j;
+	vector_t ambient = { .15f, .15f, .15f, 0.f };
 	assert(ptr);
 	device->framebuffer = (IUINT32**)ptr;
 	device->zbuffer = (float**)(ptr + sizeof(void*) * height);
@@ -928,10 +973,9 @@ void device_init(device_t *device, int width, int height, void *fb) {
 	device->light_dir.y = 0.f;
 	device->light_dir.z = 1.f;
 	device->light_dir.w = 0.f;
-	device->ambient.r = .15f;
-	device->ambient.g = .15f;
-	device->ambient.b = .15f;
+	device->ambient = _mm_load_ps((float*)&ambient);
 	transform_init(&device->transform, width, height);
+	update_light_matrix(device);
 	device->render_state = RENDER_STATE_WIREFRAME;
 }
 
@@ -976,12 +1020,12 @@ void device_pixel(device_t *device, int x, int y, IUINT32 color, float rhw) {
 }
 
 // 绘制线段
-void device_draw_line(device_t *device, const vertex_t *v1, const vertex_t *v2, IUINT32 c) {
-	int x1 = (int)v1->pos.x, x2 = (int)v2->pos.x, y1 = (int)v1->pos.y, y2 = (int)v2->pos.y;
-	float rhw = v1->rhw, rhwstp = (v2->rhw - v1->rhw);
+void device_draw_line(device_t *device, const float* v1, const float* v2, IUINT32 c) {
+	int x1 = (int)v1[0], x2 = (int)v2[0], y1 = (int)v1[1], y2 = (int)v2[1];
+	float rhw = v1[vl - 1], rhwstp = (v2[vl - 1] - v1[vl - 1]);
 	int x, y, rem = 0, offset;
 	if (x1 == x2 && y1 == y2) {
-		device_pixel(device, x1, y1, c, v1->rhw);
+		device_pixel(device, x1, y1, c, v1[vl - 1]);
 	}
 	else if (x1 == x2) {
 		int inc = (y1 <= y2) ? 1 : -1;
@@ -1000,7 +1044,7 @@ void device_draw_line(device_t *device, const vertex_t *v1, const vertex_t *v2, 
 		int dy = abs(y2 - y1);
 		if (dx >= dy) {
 			rhwstp /= dx;
-			if (x2 < x1) x = x1, y = y1, x1 = x2, y1 = y2, x2 = x, y2 = y, rhw = v2->rhw, rhwstp = -rhwstp;
+			if (x2 < x1) x = x1, y = y1, x1 = x2, y1 = y2, x2 = x, y2 = y, rhw = v2[vl - 1], rhwstp = -rhwstp;
 			offset = (y2 >= y1) ? 1 : -1;
 			for (x = x1, y = y1; x <= x2; x++, rhw += rhwstp) {
 				device_pixel(device, x, y, c, rhw);
@@ -1015,7 +1059,7 @@ void device_draw_line(device_t *device, const vertex_t *v1, const vertex_t *v2, 
 		}
 		else {
 			rhwstp /= dy;
-			if (y2 < y1) x = x1, y = y1, x1 = x2, y1 = y2, x2 = x, y2 = y, rhw = v2->rhw, rhwstp = -rhwstp;
+			if (y2 < y1) x = x1, y = y1, x1 = x2, y1 = y2, x2 = x, y2 = y, rhw = v2[vl - 1], rhwstp = -rhwstp;
 			offset = (x2 > x1) ? 1 : -1;
 			for (x = x1, y = y1; y <= y2; y++, rhw += rhwstp) {
 				device_pixel(device, x, y, c, rhw);
@@ -1055,6 +1099,22 @@ void device_texture_read(color_t *cc, const device_t *device, float u, float v) 
 	cc->b = b00*wx*wy + b01*dx*wy + b10*wx*dy + b11*dx*dy;
 }
 
+void colorPS(device_t* device, color_t* o, float* v, float w) {
+	o->r = v[4] * w * 255;
+	o->g = v[5] * w * 255;
+	o->b = v[6] * w * 255;
+}
+void texturePS(device_t* device, color_t* o, float* v, float w) {
+	float tu = v[16] * w;
+	float tv = v[17] * w;
+	float shadow = shadowmap_test(device, (point_t*)&v[8]) ? .1f : 1.f;
+	float specular = v[15] * w;
+	device_texture_read(o, device, tu, tv);
+	o->r = (o->r * v[12] * w + specular) * shadow;
+	o->g = (o->r * v[13] * w + specular) * shadow;
+	o->b = (o->r * v[14] * w + specular) * shadow;
+}
+void(*PS_func)(device_t* device, color_t* o, float* v, float w) = colorPS;
 // 绘制扫描线
 void device_draw_scanline(device_t *device, scanline_t *scanline) {
 	IUINT32 *framebuffer = device->framebuffer[scanline->y];
@@ -1065,56 +1125,23 @@ void device_draw_scanline(device_t *device, scanline_t *scanline) {
 	int render_state = device->render_state;
 	int R, G, B;
 	color_t cc;
-	float cDiffuse;
-	vector_t Nw;
-#ifdef NORMAL_INTERP
-	float cSpecular;
-	vector_t Vw, Hw;
-	Vw.x = device->transform.view.m[0][2];
-	Vw.y = device->transform.view.m[1][2];
-	Vw.z = device->transform.view.m[2][2];
-#endif
+	float cDiffuse = 1.f;
 	for (; w > 0; x++, w--) {
 		if (x >= 0 && x < width) {
-			float rhw = scanline->v.rhw;
+			float rhw = scanline->v[vl - 1];
 			if (rhw >= zbuffer[x]) {
 				float w = 1.f / rhw;
 				zbuffer[x] = rhw;
-				if (render_state & RENDER_STATE_COLOR) {
-					cDiffuse = shadowmap_test(&scanline->v.posW) ? .1f : 1.f;
-					cc.r = scanline->v.color.r * w * cDiffuse * 255;
-					cc.g = scanline->v.color.g * w * cDiffuse * 255;
-					cc.b = scanline->v.color.b * w * cDiffuse * 255;
-				}
-				if (render_state & RENDER_STATE_TEXTURE) {
-					float u = scanline->v.tc.u * w;
-					float v = scanline->v.tc.v * w;
-					device_texture_read(&cc, device, u, v);
-					// per-pixel Blinn-Phong Illumination
-					Nw = scanline->v.normal;
-					vector_normalize(&Nw);
-					cDiffuse = saturate(-vector_dotproduct(&device->light_dir, &Nw));
-					if (shadowmap_test(&scanline->v.posW))
-						cDiffuse *= .1f;
-					cc.r *= device->ambient.r + cDiffuse;
-					cc.g *= device->ambient.g + cDiffuse;
-					cc.b *= device->ambient.b + cDiffuse;
-#ifdef NORMAL_INTERP
-					vector_add(&Hw, &Vw, &device->light_dir);
-					vector_normalize(&Hw);
-					cSpecular = saturate(powf(vector_dotproduct(&Nw, &Hw), 400)) * 255;
-					cc.r += cSpecular; cc.g += cSpecular; cc.b += cSpecular;
-#endif
-				}
+
+				PS_func(device, &cc, scanline->v, w);
 
 				R = CMID((int)cc.r, 0, 255);
 				G = CMID((int)cc.g, 0, 255);
 				B = CMID((int)cc.b, 0, 255);
 				framebuffer[x] = (R << 16) | (G << 8) | (B);
-				//framebuffer[x] = ((int)cc.r << 16) | ((int)cc.g << 8) | ((int)cc.b);
 			}
 		}
-		vertex_add(&scanline->v, &scanline->step);
+		vertex_add(scanline->v, scanline->step);
 		if (x >= width) break;
 	}
 }
@@ -1135,26 +1162,79 @@ void device_render_trap(device_t *device, trapezoid_t *trap) {
 	}
 }
 
-int cull_and_clip(vertex_t* v, unsigned int* id) {
-	int c[7];
+void wireframeVS(device_t* device, float* o, const vertex_t *v) {
+	__m128 p, w;
+	matrix_apply((vector_t*)&o[0], &v->pos, &device->transform.transform);
+	o[7] = 1.f / o[3];
+	p = _mm_load_ps((float*)&o[0]);
+	w = _mm_repx_ps(_mm_load_ss(&o[7]));
+	p = _mm_mul_ps(p, w);
+	_mm_store_ps(&o[0], p);
+}
+void colorVS(device_t* device, float* o, const vertex_t *v) {
+	__m128 p, c, w;
+	matrix_apply((vector_t*)&o[0], &v->pos, &device->transform.transform);
+	o[7] = 1.f / o[3];
 
-	c[0] = transform_check_cvv(&v[0].pos);
-	c[1] = transform_check_cvv(&v[1].pos);
-	c[2] = transform_check_cvv(&v[2].pos);
+	p = _mm_load_ps((float*)&o[0]);
+	c = _mm_load_ps((float*)&v->color);
+	w = _mm_repx_ps(_mm_load_ss(&o[7]));
+	p = _mm_mul_ps(p, w);
+	c = _mm_mul_ps(c, w);
+	_mm_store_ps(&o[0], p);
+	_mm_store_ps(&o[4], c);
+	_mm_store_ss(&o[7], w);
+}
+void textureVS(device_t* device, float* o, const vertex_t *v) {
+	__m128 p, t, c, w;
+	float rhw;
+	matrix_apply((vector_t*)&o[0], &v->pos, &device->transform.transform);
+	matrix_apply((vector_t*)&o[4], &v->normal, &device->transform.world);
+	matrix_apply((vector_t*)&o[8], &v->pos, &device->transform.world);
+	rhw = 1.f / o[3];
 
+	vector_normalize((vector_t*)&o[4]);
+	o[12] = o[13] = o[14] = saturate(-vector_dotproduct(&device->light_dir, (vector_t*)&o[4]));
+
+	vector_add((vector_t*)&o[16], (vector_t*)&o[4], &device->light_dir);
+	vector_normalize((vector_t*)&o[16]);
+	o[15] = saturate(powf(vector_dotproduct((vector_t*)&o[4], (vector_t*)&o[16]), 400)) * 255;
+
+	p = _mm_load_ps(&o[0]);
+	t = _mm_load_ps((float*)&v->tc);
+	c = _mm_add_ps(device->ambient, _mm_load_ps(&o[12]));
+	w = _mm_repx_ps(_mm_load_ss(&rhw));
+	p = _mm_mul_ps(p, w);
+	t = _mm_mul_ps(t, w);
+	c = _mm_mul_ps(c, w);
+	_mm_store_ps(&o[0], p);
+	_mm_store_ps(&o[12], c);
+	_mm_store_ps(&o[16], t);
+	_mm_store_ss(&o[19], w);
+	//o[19] = rhw;
+}
+void(*VS_func)(device_t* ts, float* y, const vertex_t *x) = textureVS;
+
+int cull_and_clip(float v[5][VL], int* id) {
+	int c[3];
+
+	c[0] = transform_check_cvv(v[0]);
+	c[1] = transform_check_cvv(v[1]);
+	c[2] = transform_check_cvv(v[2]);
+
+	if (v[0][vl - 1] < 0.f || v[1][vl - 1] < 0.f || v[2][vl - 1] < 0.f)
+		return 0;
 	// 完全在平截头体外
 	if (c[0] & c[1] & c[2]) return 0;
 	{ // CCW背面剔除
 		vector_t a1, a2;
-		vector_sub(&a1, &v[1].pos, &v[0].pos);
-		vector_sub(&a2, &v[2].pos, &v[0].pos);
+		vector_sub(&a1, (vector_t*)v[1], (vector_t*)v[0]);
+		vector_sub(&a2, (vector_t*)v[2], (vector_t*)v[0]);
 		if (a1.x*a2.y - a2.x*a1.y > 0) return 0;
 	}
+
 	// 完全在平截头体内
 	if (!c[0] && !c[1] && !c[2]) return 3;
-
-	if (v[0].rhw < 0.f || v[1].rhw < 0.f || v[2].rhw < 0.f)
-		return 0;
 
 	// 近平面裁剪
 	if ((c[0] | c[1] | c[2]) & 1) {
@@ -1167,62 +1247,83 @@ int cull_and_clip(vertex_t* v, unsigned int* id) {
 			id[1] = (out[0] + 2) % 3;
 			id[2] = 3;
 			id[3] = 4;
-			vertex_interp(&v[3], &v[id[1]], &v[out[0]], v[id[1]].pos.z / (v[id[1]].pos.z - v[out[0]].pos.z));
-			vertex_interp(&v[4], &v[id[0]], &v[out[0]], v[id[0]].pos.z / (v[id[0]].pos.z - v[out[0]].pos.z));
+			vertex_interp(v[3], v[id[1]], v[out[0]], v[id[1]][2] / (v[id[1]][2] - v[out[0]][2]));
+			vertex_interp(v[4], v[id[0]], v[out[0]], v[id[0]][2] / (v[id[0]][2] - v[out[0]][2]));
 			return 4;
 		}
 		else {
 			id[0] = 3 - out[0] - out[1];
 			id[1] = 3;
 			id[2] = 4;
-			vertex_interp(&v[3], &v[id[0]], &v[out[0]], v[id[0]].pos.z / (v[id[0]].pos.z - v[out[0]].pos.z));
-			vertex_interp(&v[4], &v[id[0]], &v[out[1]], v[id[0]].pos.z / (v[id[0]].pos.z - v[out[1]].pos.z));
+			vertex_interp(v[3], v[id[0]], v[out[0]], v[id[0]][2] / (v[id[0]][2] - v[out[0]][2]));
+			vertex_interp(v[4], v[id[0]], v[out[1]], v[id[0]][2] / (v[id[0]][2] - v[out[1]][2]));
 			return 3;
 		}
 	}
 
 	return 3;
 }
+int(*clipping_func)(float v[5][VL], int* id) = cull_and_clip;
 
 // pipeline
 void device_draw_primitive(device_t *device, const vertex_t *v1,
 	const vertex_t *v2, const vertex_t *v3) {
-	static vertex_t t[7];
-	static unsigned int id[7];
+	static __declspec(align(16)) float t[5][VL];
+	static int id[5];
 	int render_state = device->render_state;
 	int vertex_cnt, i;
-	t[0] = *v1, t[1] = *v2, t[2] = *v3;
 	id[0] = 0; id[1] = 1; id[2] = 2;
 
-	transform_apply(&device->transform, &t[0], &v1->pos);
-	transform_apply(&device->transform, &t[1], &v2->pos);
-	transform_apply(&device->transform, &t[2], &v3->pos);
+	VS_func(device, t[0], v1);
+	VS_func(device, t[1], v2);
+	VS_func(device, t[2], v3);
 
 	// 剔除与裁剪
-	if ((vertex_cnt = cull_and_clip(t, id)) == 0) return;
+	if ((vertex_cnt = clipping_func(t, id)) == 0) return;
 
-	for (i = 0; i < vertex_cnt; i++) {
-		transform_to_screen(&device->transform, &t[id[i]].pos, &t[id[i]].pos);
-		matrix_apply(&t[id[i]].normal, &t[id[i]].normal, &device->transform.world);
-	}
+	//屏幕映射
+	for (i = 0; i < vertex_cnt; i++)
+		transform_to_screen(&device->transform, t[id[i]], t[id[i]]);
 
 	if (render_state & RENDER_STATE_POINT) { // 点绘制
 		for (i = 0; i < vertex_cnt; i++)
-			device_pixel(device, (int)t[id[i]].pos.x, (int)t[id[i]].pos.y, device->foreground, t[id[i]].rhw);
+			device_pixel(device, (int)t[id[i]][0], (int)t[id[i]][1], device->foreground, t[id[i]][vl - 1]);
 	}
 	else if (render_state & RENDER_STATE_WIREFRAME) { // 线框绘制
 		for (i = 0; i < vertex_cnt; i++)
-			device_draw_line(device, &t[id[i]], &t[id[(i + 1) % vertex_cnt]], device->foreground);
+			device_draw_line(device, t[id[i]], t[id[(i + 1) % vertex_cnt]], device->foreground);
 	}
 	else { // 纹理或者色彩绘制
 		trapezoid_t traps[2];
 		int n;
 		for (i = 2; i < vertex_cnt; i++) {
-			n = trapezoid_init_triangle(traps, &t[id[0]], &t[id[i - 1]], &t[id[i]]);
+			n = trapezoid_init_triangle(traps, t[id[0]], t[id[i - 1]], t[id[i]]);
 			if (n >= 1) device_render_trap(device, &traps[0]);
 			if (n >= 2) device_render_trap(device, &traps[1]);
 		}
 	}
+}
+
+void device_set_render_state(device_t* device, int rs) {
+	switch (rs) {
+	case RENDER_STATE_POINT:
+	case RENDER_STATE_WIREFRAME:
+		VS_func = wireframeVS;
+		vl = 8;
+		break;
+	case RENDER_STATE_COLOR:
+		VS_func = colorVS;
+		PS_func = colorPS;
+		vl = 8;
+		break;
+	case RENDER_STATE_TEXTURE:
+		VS_func = textureVS;
+		PS_func = texturePS;
+		vl = 20;
+		break;
+	}
+	src_size = sizeof(float) * vl;
+	device->render_state = rs;
 }
 
 int screen_w, screen_h, screen_exit = 0;
@@ -1362,14 +1463,14 @@ void screen_update() {
 vertex_t grid[81];
 vertex_t knot[23232];
 vertex_t mesh[8] = {
-	{ { -1.f, -1.f, -1.f, 1.f },{ -1.f, -1.f, -1.f, 0.f },{ 0.f, 0.f, 0.f, 1.f },{ 0.f, 0.f },{ 1.f, .2f, .2f }, 1.f },
-	{ { -1.f,  1.f, -1.f, 1.f },{ -1.f,  1.f, -1.f, 0.f },{ 0.f, 0.f, 0.f, 1.f },{ 0.f, 1.f },{ .2f, 1.f, .2f }, 1.f },
-	{ { 1.f, -1.f, -1.f, 1.f },{ 1.f, -1.f, -1.f, 0.f },{ 0.f, 0.f, 0.f, 1.f },{ 1.f, 1.f },{ .2f, .2f, 1.f }, 1.f },
-	{ { 1.f,  1.f, -1.f, 1.f },{ 1.f,  1.f, -1.f, 0.f },{ 0.f, 0.f, 0.f, 1.f },{ 1.f, 0.f },{ 1.f, .2f, 1.f }, 1.f },
-	{ { -1.f, -1.f,  1.f, 1.f },{ -1.f, -1.f,  1.f, 0.f },{ 0.f, 0.f, 0.f, 1.f },{ 0.f, 0.f },{ 1.f, 1.f, .2f }, 1.f },
-	{ { -1.f,  1.f,  1.f, 1.f },{ -1.f,  1.f,  1.f, 0.f },{ 0.f, 0.f, 0.f, 1.f },{ 0.f, 1.f },{ .2f, 1.f, 1.f }, 1.f },
-	{ { 1.f, -1.f,  1.f, 1.f },{ 1.f, -1.f,  1.f, 0.f },{ 0.f, 0.f, 0.f, 1.f },{ 1.f, 1.f },{ 1.f, .3f, .3f }, 1.f },
-	{ { 1.f,  1.f,  1.f, 1.f },{ 1.f,  1.f,  1.f, 0.f },{ 0.f, 0.f, 0.f, 1.f },{ 1.f, 0.f },{ .2f, 1.f, .3f }, 1.f },
+	{ { -1.f, -1.f, -1.f, 1.f },{ -1.f, -1.f, -1.f, 0.f },{ 0.f, 0.f },{ 1.f, .2f, .2f } },
+	{ { -1.f, 1.f, -1.f, 1.f },{ -1.f, 1.f, -1.f, 0.f },{ 0.f, 1.f },{ .2f, 1.f, .2f } },
+	{ { 1.f, -1.f, -1.f, 1.f },{ 1.f, -1.f, -1.f, 0.f },{ 1.f, 1.f },{ .2f, .2f, 1.f } },
+	{ { 1.f, 1.f, -1.f, 1.f },{ 1.f, 1.f, -1.f, 0.f },{ 1.f, 0.f },{ 1.f, .2f, 1.f } },
+	{ { -1.f, -1.f, 1.f, 1.f },{ -1.f, -1.f, 1.f, 0.f },{ 0.f, 0.f },{ 1.f, 1.f, .2f } },
+	{ { -1.f, 1.f, 1.f, 1.f },{ -1.f, 1.f, 1.f, 0.f },{ 0.f, 1.f },{ .2f, 1.f, 1.f } },
+	{ { 1.f, -1.f, 1.f, 1.f },{ 1.f, -1.f, 1.f, 0.f },{ 1.f, 1.f },{ 1.f, .3f, .3f } },
+	{ { 1.f, 1.f, 1.f, 1.f },{ 1.f, 1.f, 1.f, 0.f },{ 1.f, 0.f },{ .2f, 1.f, .3f } },
 };
 unsigned int knot_index[139392];
 char states[] = { RENDER_STATE_POINT, RENDER_STATE_WIREFRAME, RENDER_STATE_COLOR, RENDER_STATE_TEXTURE };
@@ -1391,18 +1492,16 @@ void init_grid() {
 	memset(&grid, 0, sizeof(vertex_t) * 81);
 	for (i = 0; i < 9; i++) {
 		for (j = 0; j < 9; j++) {
-			//grid[i*9+j].pos.x = j * 1.f - 4.f;
-			//grid[i*9+j].pos.y = -1.2f;
-			//grid[i*9+j].pos.z = i * 1.f - 4.f;
 			grid[i * 9 + j].pos.x = j - 4.f;
 			grid[i * 9 + j].pos.y = i - 4.f;
 			grid[i * 9 + j].pos.z = 20.f;
 			grid[i * 9 + j].pos.w = 1.f;
 			grid[i * 9 + j].normal.y = 1.f;
+			grid[i * 9 + j].tc.u = .9814f;
+			grid[i * 9 + j].tc.v = .0185f;
 			grid[i * 9 + j].color.r = 1.f;
 			grid[i * 9 + j].color.g = 1.f;
 			grid[i * 9 + j].color.b = 1.f;
-			grid[i * 9 + j].rhw = 1.f;
 		}
 	}
 }
@@ -1425,7 +1524,6 @@ void init_knot() {
 		knot[i].pos.w = 1.f;
 		knot[i].tc.u = .9814f;
 		knot[i].tc.v = .0185f;//.502f;
-		knot[i].rhw = 1.f;
 		sum = knot[i].pos.x + knot[i].pos.y + knot[i].pos.z;
 		if (sum > max) max = sum;
 		else if (sum < min) min = sum;
@@ -1542,98 +1640,97 @@ return 0;
 }
 
 /**/
-#define SHADOWMAP VK_XBUTTON2
+
 float shadowmap[1024 * 1024];
 int sm_res = 1024;
 int sm_len = 1024 * 1024;
-void shadowmap_draw_scanline(device_t* device, scanline_t* scanline) {
-	float *sdm = &shadowmap[scanline->y * sm_res];
-	int x = scanline->x;
-	int w = scanline->w;
-	for (; w > 0; x++, w--) {
-		if (x >= 0 && x < sm_res) {
-			float z = scanline->v.pos.z;
-			int* a = (int*)&sdm[x];
-			if (z < sdm[x])
-				sdm[x] = z;
-		}
-		vertex_add(&scanline->v, &scanline->step);
-		if (x >= sm_res) break;
-	}
+//void shadowmap_draw_scanline(device_t* device, scanline_t* scanline) {
+//	float *sdm = &shadowmap[scanline->y * sm_res];
+//	int x = scanline->x;
+//	int w = scanline->w;
+//	for (; w > 0; x++, w--) {
+//		if (x >= 0 && x < sm_res) {
+//			float z = scanline->v.pos.z;
+//			int* a = (int*)&sdm[x];
+//			if (z < sdm[x])
+//				sdm[x] = z;
+//		}
+//		vertex_add(&scanline->v, &scanline->step);
+//		if (x >= sm_res) break;
+//	}
+//}
+
+//void shadowmap_draw_primitive(device_t* device, const vertex_t *v1,
+//	const vertex_t *v2, const vertex_t *v3) {
+//
+//	static vertex_t t[3];
+//	vector_t a1 = { 0.f, 0.f, 0.f, 0.f }, a2 = { 0.f, 1.f, 0.f, 0.f };
+//	trapezoid_t traps[2];
+//	matrix_t light;
+//
+//	t[0] = *v1, t[1] = *v2, t[2] = *v3;
+//	matrix_mul(&light, &device->transform.world, &device->transform.light);
+//	transform_to_light(&t[0].pos, &v1->pos, &light);
+//	transform_to_light(&t[1].pos, &v2->pos, &light);
+//	transform_to_light(&t[2].pos, &v3->pos, &light);
+//
+//	vector_sub(&a1, &t[1].pos, &t[0].pos);
+//	vector_sub(&a2, &t[2].pos, &t[0].pos);
+//	if (a1.x*a2.y - a2.x*a1.y > 0) return;
+//
+//	{
+//		int i, n = trapezoid_init_triangle(traps, &t[0], &t[1], &t[2]);
+//		for (i = 0; i < n; i++) {
+//			scanline_t scanline;
+//			int j, top, bottom;
+//			top = (int)(traps[i].top + .5f);
+//			bottom = (int)(traps[i].bottom + .5f);
+//			for (j = top; j < bottom; j++) {
+//				if (j >= 0 && j < sm_res) {
+//					trapezoid_edge_interp(&traps[i], (float)j + .5f);
+//					trapezoid_init_scan_line(&traps[i], &scanline, j);
+//					shadowmap_draw_scanline(device, &scanline);
+//				}
+//				if (j >= sm_res) break;
+//			}
+//		}
+//	}
+//}
+
+void transform_to_light(vector_t* p, const vector_t* v, const matrix_t* light) {
+	matrix_apply(p, v, light);
+	p->x = p->x * .083f * sm_res;
+	p->y = p->y * .083f * sm_res;
 }
 
-void transform_to_light(vector_t* p, const vector_t* v) {
-	p->x = (v->x + 4.f) * .083f * sm_res;
-	p->y = (v->y + 4.f) * .083f * sm_res;
+void shadowmapVS(device_t* ts, float* y, const vertex_t *x) {
+
 }
 
+void shadowmapPS(device_t* device, color_t* o, float* v, float w) {
 
-void shadowmap_draw_primitive(device_t* device, const vertex_t *v1,
-	const vertex_t *v2, const vertex_t *v3) {
-
-	static vertex_t t[3];
-	vector_t a1 = { 0.f, 0.f, 0.f, 0.f }, a2 = { 0.f, 1.f, 0.f, 0.f };
-	trapezoid_t traps[2];
-	//matrix_t light;
-
-	//matrix_set_lookat(&light, &a1, &device->light_dir, &a2);
-	//matrix_mul(&light, &device->transform.world, &light);
-
-	t[0] = *v1, t[1] = *v2, t[2] = *v3;
-	matrix_apply(&t[0].pos, &v1->pos, &device->transform.world);
-	matrix_apply(&t[1].pos, &v2->pos, &device->transform.world);
-	matrix_apply(&t[2].pos, &v3->pos, &device->transform.world);
-
-	vector_sub(&a1, &t[1].pos, &t[0].pos);
-	vector_sub(&a2, &t[2].pos, &t[0].pos);
-	if (a1.x*a2.y - a2.x*a1.y > 0) return;
-
-	transform_to_light(&t[0].pos, &t[0].pos);
-	transform_to_light(&t[1].pos, &t[1].pos);
-	transform_to_light(&t[2].pos, &t[2].pos);
-
-	{
-		int i, n = trapezoid_init_triangle(traps, &t[0], &t[1], &t[2]);
-		for (i = 0; i < n; i++) {
-			scanline_t scanline;
-			int j, top, bottom;
-			top = (int)(traps[i].top + .5f);
-			bottom = (int)(traps[i].bottom + .5f);
-			for (j = top; j < bottom; j++) {
-				if (j >= 0 && j < sm_res) {
-					trapezoid_edge_interp(&traps[i], (float)j + .5f);
-					trapezoid_init_scan_line(&traps[i], &scanline, j);
-					shadowmap_draw_scanline(device, &scanline);
-				}
-				if (j >= sm_res) break;
-			}
-		}
-	}
 }
 
 void shadowmap_begin() {
-	/**/
-	int i;
-	for (i = 0; i < sm_len; i++) shadowmap[i] = 1e3f;
-	/**
-	memset(shadowmap, 1, sizeof(float) * 1024 * 1024);
-	/**/
-	screen_keys[SHADOWMAP] = 1;
+	memset(shadowmap, 127, sizeof(float) * sm_len);
+	VS_func = shadowmapVS;
+	PS_func = shadowmapPS;
+	vl = 8;
+	src_size = sizeof(float) * vl;
 }
 
-void shadowmap_end() {
-	screen_keys[SHADOWMAP] = 0;
+void shadowmap_end(device_t* device, int rs) {
+	device_set_render_state(device, rs);
 }
 
-char shadowmap_test(const point_t* p) {
+char shadowmap_test(device_t* device, const point_t* p) {
 	vector_t v; int x, y, idx;
-	transform_to_light(&v, p);
+	transform_to_light(&v, p, &device->transform.light);
 	x = (int)(v.x + .5f), y = (int)(v.y + .5f);
 	if (x <= 0 || x >= sm_res || y <= 0 || y >= sm_res) return 0;
 	idx = y * sm_res + x;
-	return (p->z) - shadowmap[idx] > .2f;
+	return (p->z) - shadowmap[idx] > 96.f / sm_res;
 }
-/**/
 
 void draw_plane(device_t *device, int a, int b, int c, int d, const vector_t* normal) {
 	vertex_t p1 = mesh[a], p2 = mesh[b], p3 = mesh[c], p4 = mesh[d];
@@ -1642,14 +1739,8 @@ void draw_plane(device_t *device, int a, int b, int c, int d, const vector_t* no
 #ifndef NORMAL_INTERP
 	p1.normal = p2.normal = p3.normal = p4.normal = *normal;
 #endif
-	if (screen_keys[SHADOWMAP]) {
-		shadowmap_draw_primitive(device, &p1, &p2, &p3);
-		shadowmap_draw_primitive(device, &p3, &p2, &p4);
-	}
-	else {
-		device_draw_primitive(device, &p1, &p2, &p3);
-		device_draw_primitive(device, &p3, &p2, &p4);
-	}
+	device_draw_primitive(device, &p1, &p2, &p3);
+	device_draw_primitive(device, &p3, &p2, &p4);
 }
 
 void draw_box(device_t *device) {
@@ -1672,14 +1763,16 @@ void draw_grid(device_t *device, int oldRS, const matrix_t *m) {
 	matrix_t o = device->transform.world;
 	device->transform.world = *m;
 	transform_update(&device->transform);
-	device->render_state = RENDER_STATE_COLOR;
+	//if (device->render_state == RENDER_STATE_TEXTURE)
+	//	device_set_render_state(device, RENDER_STATE_COLOR);
 	for (i = 0; i < 8; i++) {
 		for (j = 0; j < 8; j++) {
 			device_draw_primitive(device, &grid[i * 9 + j], &grid[(i + 1) * 9 + j], &grid[i * 9 + j + 1]);
 			device_draw_primitive(device, &grid[i * 9 + j + 1], &grid[(i + 1) * 9 + j], &grid[(i + 1) * 9 + j + 1]);
 		}
 	}
-	device->render_state = states[oldRS];
+	//if (states[oldRS] == RENDER_STATE_TEXTURE) 
+	//	device_set_render_state(device, RENDER_STATE_TEXTURE);
 	device->transform.world = o;
 }
 
@@ -1692,12 +1785,8 @@ void draw_knot(device_t *device) {
 	t.m[0][0] = 10.f; t.m[1][1] = 10.f; t.m[2][2] = 10.f; t.m[3][2] = 10.f;
 	matrix_mul(&device->transform.world, &o, &t);
 	transform_update(&device->transform);
-	if (screen_keys[SHADOWMAP])
-		for (i = 0; i < 46464; i++)
-			shadowmap_draw_primitive(device, &knot[knot_index[i * 3]], &knot[knot_index[i * 3 + 1]], &knot[knot_index[i * 3 + 2]]);
-	else
-		for (i = 0; i < 46464; i++)
-			device_draw_primitive(device, &knot[knot_index[i * 3]], &knot[knot_index[i * 3 + 1]], &knot[knot_index[i * 3 + 2]]);
+	for (i = 0; i < 46464; i++)
+		device_draw_primitive(device, &knot[knot_index[i * 3]], &knot[knot_index[i * 3 + 1]], &knot[knot_index[i * 3 + 2]]);
 	device->transform.world = o;
 	transform_update(&device->transform);
 }
@@ -1713,9 +1802,9 @@ void write_FPS() {
 	else cnt++;
 #ifdef CALL_CNT 
 	sprintf_s(debug, 512, "vl %d\nvadd %d\nvsub %d\nvsca %d\nvdot %d\nvcross %d\n\
-vinterp %d\nvnor %d\nmadd %d\nmsub %d\nmmul %d\nmsca %d\nmapp %d\nmid %d\nmzero %d\n\
-mtra %d\nmssca %d\nmrot %d\nmproj %d\nmlook %d\n", vl, vadd, vsub, vsca, vdot, vcross,
-vinterp, vnor, madd, msub, mmul, msca, mapp, mid, mzero, mtra, mssca, mrot, mproj, mlook);
+						  vinterp %d\nvnor %d\nmadd %d\nmsub %d\nmmul %d\nmsca %d\nmapp %d\nmid %d\nmzero %d\n\
+						  mtra %d\nmssca %d\nmrot %d\nmproj %d\nmlook %d\n", vl, vadd, vsub, vsca, vdot, vcross,
+		vinterp, vnor, madd, msub, mmul, msca, mapp, mid, mzero, mtra, mssca, mrot, mproj, mlook);
 	vl = vadd = vsub = vsca = vdot = vcross = vinterp = vnor = madd = msub =
 		mmul = msca = mapp = mid = mzero = mtra = mssca = mrot = mproj = mlook = 0;
 #endif
@@ -1783,7 +1872,7 @@ int main()
 	init_knot();
 	init_grid();
 	init_texture(&device);
-	device.render_state = states[indicator];
+	device_set_render_state(&device, states[indicator]);
 
 	matrix_set_identity(&m1); matrix_set_identity(&m2); matrix_set_identity(&id);
 	matrix_set_rotate(&device.transform.world, 1.f, -.5f, 1.f, 1.4f);
@@ -1822,7 +1911,7 @@ int main()
 			if (kbhit == 0) {
 				kbhit = 1;
 				if (indicator++ >= 3) indicator = 0;
-				device.render_state = states[indicator];
+				device_set_render_state(&device, states[indicator]);
 			}
 		}
 		else kbhit = 0;
@@ -1877,10 +1966,10 @@ int main()
 
 		update_camera(&device.transform.view, &eye, &up, &xaxis, &yaxis, &zaxis);
 		transform_update(&device.transform);
-		shadowmap_begin();
-		draw_box(&device);
-		draw_knot(&device);
-		shadowmap_end();
+		//shadowmap_begin();
+		//draw_box(&device);
+		//draw_knot(&device);
+		//shadowmap_end(&device);
 
 		draw_box(&device);
 		draw_knot(&device);

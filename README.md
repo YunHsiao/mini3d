@@ -17,3 +17,4 @@ Features
 * Bilinear filtered texture sampling
 * per-pixel Blinn-Phong illumination
 * simple shadow mapping
+* flexible vertex format
