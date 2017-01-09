@@ -16,3 +16,4 @@ Features
 * load model from text file
 * Bilinear filtered texture sampling
 * per-pixel Blinn-Phong illumination
+* simple shadow mapping
