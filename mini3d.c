@@ -626,6 +626,7 @@ typedef struct {
 	matrix_t view;          // 摄影机坐标变换
 	matrix_t projection;    // 投影变换
 	matrix_t light;			// 世界-光源空间变换
+	matrix_t o2l;			// 物体-光源空间变换
 	matrix_t transform;     // transform = world * view * projection
 	float w, h;             // 屏幕大小
 }	transform_t;
@@ -635,6 +636,7 @@ void transform_update(transform_t *ts) {
 	matrix_t m;
 	matrix_mul(&m, &ts->world, &ts->view);
 	matrix_mul(&ts->transform, &m, &ts->projection);
+	matrix_mul(&ts->o2l, &ts->world, &ts->light);
 }
 
 // 初始化，设置屏幕长宽
@@ -972,6 +974,12 @@ void device_draw_line(device_t *device, const float* v1, const float* v2, IUINT3
 
 // 根据坐标读取纹理
 void device_texture_read(color_t *cc, const device_t *device, float u, float v) {
+	/**
+	IUINT32 c = device->texture[(int)(v * (device->max_v - 1))][(int)(u * (device->max_u - 1))];
+	cc->r = (float) ((c & 0xff0000) >> 16);
+	cc->g = (float) ((c & 0xff00) >> 8);
+	cc->b = (float) (c & 0xff);
+	/**/
 	int x, y; float dx, dy, wx, wy;
 	IUINT32 c00, c01, c10, c11;
 	IUINT32 r00, r01, r10, r11, g00, g01, g10, g11, b00, b01, b10, b11;
@@ -992,15 +1000,16 @@ void device_texture_read(color_t *cc, const device_t *device, float u, float v) 
 	cc->r = r00*wx*wy + r01*dx*wy + r10*wx*dy + r11*dx*dy;
 	cc->g = g00*wx*wy + g01*dx*wy + g10*wx*dy + g11*dx*dy;
 	cc->b = b00*wx*wy + b01*dx*wy + b10*wx*dy + b11*dx*dy;
+	/**/
 }
 
 void colorPS(device_t* device, color_t* o, scanline_t* sl, IUINT32* fb, float* zb, int x) {
-	float rhw = sl->v[vl - 1];
-	{ if (rhw < *zb) return; }
-	*zb = rhw;
-	float* v = sl->v;
-	float w = 1 / rhw;
+	float rhw = sl->v[vl - 1], *v, w;
 	int R, G, B;
+	if (rhw < *zb) return;
+	v = sl->v;
+	w = 1 / rhw;
+	*zb = rhw;
 	o->r = v[4] * w * 255;
 	o->g = v[5] * w * 255;
 	o->b = v[6] * w * 255;
@@ -1010,16 +1019,16 @@ void colorPS(device_t* device, color_t* o, scanline_t* sl, IUINT32* fb, float* z
 	*fb = (R << 16) | (G << 8) | (B);
 }
 void texturePS(device_t* device, color_t* o, scanline_t* sl, IUINT32* fb, float* zb, int x) {
-	float rhw = sl->v[vl - 1];
-	{ if (rhw < *zb) return; }
-	*zb = rhw;
-	float* v = sl->v;
-	float w = 1 / rhw;
-	float tu = v[16] * w;
-	float tv = v[17] * w;
-	float shadow = shadowmap_test(device, (point_t*)&v[8]) ? .1f : 1.f;
-	float specular = v[15] * w;
+	float rhw = sl->v[vl - 1], *v, w, tu, tv, shadow, specular;
 	int R, G, B;
+	if (rhw < *zb) return;
+	v = sl->v;
+	w = 1 / rhw;
+	tu = v[16] * w;
+	tv = v[17] * w;
+	shadow = shadowmap_test(device, (point_t*)&v[8]) ? .1f : 1.f;
+	specular = v[15] * w;
+	*zb = rhw;
 	device_texture_read(o, device, tu, tv);
 	o->r = (o->r * v[12] * w + specular) * shadow;
 	o->g = (o->g * v[13] * w + specular) * shadow;
@@ -1037,7 +1046,6 @@ void device_draw_scanline(device_t *device, scanline_t* scanline) {
 	int x = scanline->x;
 	int w = scanline->w;
 	int width = device->width;
-	int render_state = device->render_state;
 	color_t cc;
 	float cDiffuse = 1.f;
 	for (; w > 0; x++, w--) {
@@ -1073,12 +1081,18 @@ void colorVS(device_t* device, float* o, const vertex_t *v) {
 	_mm_store_ps(&o[4], c);
 	_mm_store_ss(&o[vl - 1], w);
 }
+
+float shadowmap[1024 * 1024];
+int sm_res = 1024;
+int sm_len = 1024 * 1024;
 void textureVS(device_t* device, float* o, const vertex_t *v) {
 	__m128 t, c, w;
 	vector_t Hw;
 	matrix_apply((vector_t*)&o[4], &v->normal, &device->transform.world);
-	matrix_apply((vector_t*)&o[8], &v->pos, &device->transform.world);
+	matrix_apply((vector_t*)&o[8], &v->pos, &device->transform.o2l);
 
+	o[8] = o[8] * .083f * sm_res;
+	o[9] = o[9] * .083f * sm_res;
 	vector_normalize((vector_t*)&o[4]);
 	o[12] = o[13] = o[14] = saturate(-vector_dotproduct(&device->light_dir, (vector_t*)&o[4]));
 
@@ -1128,13 +1142,11 @@ int near_plane_clip(float v[5][VL], int* id, int* c) {
 
 	return 3;
 }
-int no_clipping(float v[5][VL], int* id, int* c) { return 3; }
-int(*clipping_func)(float v[5][VL], int* id, int* c) = near_plane_clip;
 
-void wvp_transform(const transform_t* ts, float* v, const float* p) {
+void wvp_transform(const transform_t* ts, float v[VL], const float* p) {
 	v[vl - 1] = matrix_apply_homogenous(v, p, &ts->transform);
 }
-void(*transform_func)(const transform_t* ts, float* v, const float* p) = wvp_transform;
+void(*transform_func)(const transform_t* ts, float v[VL], const float* p) = wvp_transform;
 
 char ccw_cull(float v[5][VL], int* c) {
 	vector_t a1, a2;
@@ -1157,6 +1169,8 @@ char frustum_cull(float v[5][VL], int* c) {
 }
 char(*cull_func)(float v[5][VL], int* c) = frustum_cull;
 
+int RS_CLIPPING = 1;
+int RS_SCREEN_MAPPING = 1;
 // pipeline
 void device_draw_primitive(device_t *device, const vertex_t *v1,
 	const vertex_t *v2, const vertex_t *v3) {
@@ -1178,11 +1192,13 @@ void device_draw_primitive(device_t *device, const vertex_t *v1,
 	VS_func(device, t[2], v3);
 
 	// 裁剪
-	vertex_cnt = clipping_func(t, id, c);
+	vertex_cnt = RS_CLIPPING ? near_plane_clip(t, id, c) : 3;
 
 	//屏幕映射
-	for (i = 0; i < vertex_cnt; i++)
-		transform_to_screen(&device->transform, t[id[i]], t[id[i]]);
+	if (RS_SCREEN_MAPPING) {
+		for (i = 0; i < vertex_cnt; i++)
+			transform_to_screen(&device->transform, t[id[i]], t[id[i]]);
+	}
 
 	if (render_state & RENDER_STATE_POINT) { // 点绘制
 		for (i = 0; i < vertex_cnt; i++)
@@ -1222,10 +1238,12 @@ void device_set_render_state(device_t* device, int rs) {
 		break;
 	}
 	transform_func = wvp_transform;
-	clipping_func = near_plane_clip;
 	cull_func = frustum_cull;
+	RS_CLIPPING = 1;
+	RS_SCREEN_MAPPING = 1;
 	src_size = sizeof(float) * vl;
 	device->render_state = rs;
+
 }
 
 int screen_w, screen_h, screen_exit = 0;
@@ -1424,8 +1442,9 @@ void init_knot() {
 		fscanf_s(file, " %f %f %f\n", &knot[i].pos.x, &knot[i].pos.y, &knot[i].pos.z);
 		knot[i].pos.x -= .5f; knot[i].pos.y -= .5f; knot[i].pos.z -= .4f;
 		knot[i].pos.w = 1.f;
-		knot[i].tc.u = .9814f;
-		knot[i].tc.v = .0185f;//.502f;
+		//knot[i].tc.u = .9814f;
+		//knot[i].tc.v = .0185f;//.502f;
+		knot[i].tc.u = knot[i].tc.v = .502f;
 		sum = knot[i].pos.x + knot[i].pos.y + knot[i].pos.z;
 		if (sum > max) max = sum;
 		else if (sum < min) min = sum;
@@ -1465,154 +1484,16 @@ void init_knot() {
 	}
 	fclose(file);
 }
-/**
-point_t smv[8];
-int smi[6][3], smt_cnt = 0;
-void shadowmap_prepare(device_t* device) {
-static int idx[6][4] = {{0, 1, 2, 3}, {6, 7, 4, 5}, {4, 5, 0, 1}, {2, 3, 6, 7}, {1, 5, 3, 7}, {4, 0, 6, 2}};
-vector_t a1, a2;
-int i; smt_cnt = 0;
-for (i = 0; i < 8; i++) matrix_apply(&smv[i], &mesh[i].pos, &device->transform.world);
 
-for (i = 0; i < 6; i++) {
-vector_sub(&a1, &smv[idx[i][1]], &smv[idx[i][0]]);
-vector_sub(&a2, &smv[idx[i][2]], &smv[idx[i][0]]);
-if (a1.x*a2.y - a2.x*a1.y < 0) {
-smi[smt_cnt][0] = idx[i][0];
-smi[smt_cnt][1] = idx[i][1];
-smi[smt_cnt++][2] = idx[i][2];
-}
-vector_sub(&a1, &smv[idx[i][1]], &smv[idx[i][2]]);
-vector_sub(&a2, &smv[idx[i][3]], &smv[idx[i][2]]);
-if (a1.x*a2.y - a2.x*a1.y < 0) {
-smi[smt_cnt][0] = idx[i][2];
-smi[smt_cnt][1] = idx[i][1];
-smi[smt_cnt++][2] = idx[i][3];
-}
-}
-}
-
-char point_behind_triangle(const point_t* v, const point_t* v1, const point_t* v2, const point_t* v3) {
-float m, n, p, q, x, y, a, b, r;
-m = v2->x - v1->x, n = v3->x - v1->x;
-p = v2->y - v1->y, q = v3->y - v1->y;
-x = v->x - v1->x, y = v->y - v1->y;
-a = (y * m - p * x) / (q * m - n * p);
-b = (x - a * n) / m;
-if (a >= 0 && b >= 0 && (a + b) <= 1) {
-r = v1->z + (v3->z - v1->z) * a + (v2->z - v1->z) * b;
-return v->z - r > .1f;
-}
-return 0;
-}
-
-float sign (const point_t* p1, const point_t* p2, const point_t* p3) {
-return (p1->x - p3->x) * (p2->y - p3->y) - (p2->x - p3->x) * (p1->y - p3->y);
-}
-
-char point_in_triangle(const point_t* p, const point_t* v1, const point_t* v2, const point_t* v3) {
-char b1, b2, b3;
-b1 = sign(p, v1, v2) < 0.f;
-b2 = sign(p, v2, v3) < 0.f;
-b3 = sign(p, v3, v1) < 0.f;
-return ((b1 == b2) && (b2 == b3));
-}
-
-char shadowmap_test(const point_t* p) {
-int i;
-point_t *v1, *v2, *v3, l, r, d;
-float t;
-char shadow;
-for (i = 0; i < smt_cnt; i++) {
-v1 = &smv[smi[i][0]], v2 = &smv[smi[i][1]], v3 = &smv[smi[i][2]];
-//if (point_behind_triangle(p, v1, v2, v3)) return 1;
-if (!point_in_triangle(p, v1, v2, v3)) continue;
-t = (p->y - v2->y) / (v1->y - v2->y);
-vector_interp(&r, v2, v1, t);
-t = (p->y - v3->y) / (v1->y - v3->y);
-vector_interp(&l, v3, v1, t);
-t = (p->x - l.x) / (r.x - l.x);
-vector_interp(&d, &l, &r, t);
-shadow = p->z - d.z > .1f;
-if (shadow)
-return shadow;
-else return 0;
-}
-return 0;
-}
-
-/**/
-
-float shadowmap[1024 * 1024];
-int sm_res = 1024;
-int sm_len = 1024 * 1024;
-//void shadowmap_draw_scanline(device_t* device, scanline_t* scanline) {
-//	float *sdm = &shadowmap[scanline->y * sm_res];
-//	int x = scanline->x;
-//	int w = scanline->w;
-//	for (; w > 0; x++, w--) {
-//		if (x >= 0 && x < sm_res) {
-//			float z = scanline->v.pos.z;
-//			int* a = (int*)&sdm[x];
-//			if (z < sdm[x])
-//				sdm[x] = z;
-//		}
-//		vertex_add(&scanline->v, &scanline->step);
-//		if (x >= sm_res) break;
-//	}
-//}
-
-//void shadowmap_draw_primitive(device_t* device, const vertex_t *v1,
-//	const vertex_t *v2, const vertex_t *v3) {
-//
-//	static vertex_t t[3];
-//	vector_t a1 = { 0.f, 0.f, 0.f, 0.f }, a2 = { 0.f, 1.f, 0.f, 0.f };
-//	trapezoid_t traps[2];
-//	matrix_t light;
-//
-//	t[0] = *v1, t[1] = *v2, t[2] = *v3;
-//	matrix_mul(&light, &device->transform.world, &device->transform.light);
-//	transform_to_light(&t[0].pos, &v1->pos, &light);
-//	transform_to_light(&t[1].pos, &v2->pos, &light);
-//	transform_to_light(&t[2].pos, &v3->pos, &light);
-//
-//	vector_sub(&a1, &t[1].pos, &t[0].pos);
-//	vector_sub(&a2, &t[2].pos, &t[0].pos);
-//	if (a1.x*a2.y - a2.x*a1.y > 0) return;
-//
-//	{
-//		int i, n = trapezoid_init_triangle(traps, &t[0], &t[1], &t[2]);
-//		for (i = 0; i < n; i++) {
-//			scanline_t scanline;
-//			int j, top, bottom;
-//			top = (int)(traps[i].top + .5f);
-//			bottom = (int)(traps[i].bottom + .5f);
-//			for (j = top; j < bottom; j++) {
-//				if (j >= 0 && j < sm_res) {
-//					trapezoid_edge_interp(&traps[i], (float)j + .5f);
-//					trapezoid_init_scan_line(&traps[i], &scanline, j);
-//					shadowmap_draw_scanline(device, &scanline);
-//				}
-//				if (j >= sm_res) break;
-//			}
-//		}
-//	}
-//}
-
-void transform_to_light(vector_t* p, const vector_t* v, const matrix_t* light) {
-	matrix_apply(p, v, light);
-	p->x = p->x * .083f * sm_res;
-	p->y = p->y * .083f * sm_res;
-}
-
-matrix_t o2l;
-void light_transform(const transform_t* ts, float* v, const float* p) {
-	matrix_apply((vector_t*)v, (vector_t*)p, &o2l);
+void light_transform(const transform_t* ts, float v[VL], const float* p) {
+	matrix_apply((vector_t*)v, (vector_t*)p, &ts->o2l);
+	v[0] = v[0] * .083f * sm_res;
+	v[1] = v[1] * .083f * sm_res;
 }
 
 void shadowmapPS(device_t* device, color_t* o, scanline_t* sl, IUINT32* fb, float* zb, int x) {
-	float* v = sl->v;
-	if (v[2] < shadowmap[x]) shadowmap[x] = v[2];
+	int idx = sl->y * sm_res + x;
+	if (sl->v[2] < shadowmap[idx]) shadowmap[idx] = sl->v[2];
 }
 
 void shadowmap_begin(device_t* device) {
@@ -1620,11 +1501,12 @@ void shadowmap_begin(device_t* device) {
 	transform_func = light_transform;
 	VS_func = wireframeVS;
 	PS_func = shadowmapPS;
-	clipping_func = no_clipping;
 	cull_func = ccw_cull;
 	vl = 8;
 	src_size = sizeof(float) * vl;
-	matrix_mul(&o2l, &device->transform.world, &device->transform.light);
+	RS_CLIPPING = 0;
+	RS_SCREEN_MAPPING = 0;
+	device->render_state = RENDER_STATE_COLOR;
 }
 
 void shadowmap_end(device_t* device, int rs) {
@@ -1632,12 +1514,11 @@ void shadowmap_end(device_t* device, int rs) {
 }
 
 char shadowmap_test(device_t* device, const point_t* p) {
-	vector_t v; int x, y, idx;
-	transform_to_light(&v, p, &device->transform.light);
-	x = (int)(v.x + .5f), y = (int)(v.y + .5f);
+	int x, y, idx;
+	x = (int)(p->x + .5f), y = (int)(p->y + .5f);
 	if (x <= 0 || x >= sm_res || y <= 0 || y >= sm_res) return 0;
 	idx = y * sm_res + x;
-	return (p->z) - shadowmap[idx] > 96.f / sm_res;
+	return ((p->z) - shadowmap[idx]) > (96.f / sm_res);
 }
 
 void draw_plane(device_t *device, int a, int b, int c, int d, const vector_t* normal) {
@@ -1671,16 +1552,12 @@ void draw_grid(device_t *device, int oldRS, const matrix_t *m) {
 	matrix_t o = device->transform.world;
 	device->transform.world = *m;
 	transform_update(&device->transform);
-	//if (device->render_state == RENDER_STATE_TEXTURE)
-	//	device_set_render_state(device, RENDER_STATE_COLOR);
 	for (i = 0; i < 8; i++) {
 		for (j = 0; j < 8; j++) {
 			device_draw_primitive(device, &grid[i * 9 + j], &grid[(i + 1) * 9 + j], &grid[i * 9 + j + 1]);
 			device_draw_primitive(device, &grid[i * 9 + j + 1], &grid[(i + 1) * 9 + j], &grid[(i + 1) * 9 + j + 1]);
 		}
 	}
-	//if (states[oldRS] == RENDER_STATE_TEXTURE) 
-	//	device_set_render_state(device, RENDER_STATE_TEXTURE);
 	device->transform.world = o;
 }
 
@@ -1785,6 +1662,7 @@ int main()
 	matrix_set_identity(&m1); matrix_set_identity(&m2); matrix_set_identity(&id);
 	matrix_set_rotate(&device.transform.world, 1.f, -.5f, 1.f, 1.4f);
 	matrix_set_lookat(&device.transform.view, &eye, &at, &up);
+	screen_keys[VK_XBUTTON2] = 1;
 
 	ShowWindow(screen_handle, SW_NORMAL);
 	while (screen_exit == 0 && screen_keys[VK_ESCAPE] == 0) {
@@ -1825,6 +1703,7 @@ int main()
 		else kbhit = 0;
 		if (screen_keys[VK_LBUTTON]) { // Model Rotation
 			vector_t drag = { 0.f, 0.f, 0.f, 0.f };
+			screen_keys[VK_XBUTTON2] = 1;
 			if (cnt++ > 10) {
 				drag_x = mouse_x;
 				drag_y = mouse_y;
@@ -1862,22 +1741,36 @@ int main()
 		else {
 			if (screen_keys[VK_NUMPAD1]) alpha -= .01f;
 			if (screen_keys[VK_NUMPAD2]) alpha += .01f;
-			if (screen_keys[VK_NUMPAD4]) { if (sm_res > 8) { sm_res -= 8; sm_len = sm_res * sm_res; } }
-			if (screen_keys[VK_NUMPAD5]) { if (sm_res < 1024) { sm_res += 8; sm_len = sm_res * sm_res; } }
+			if (screen_keys[VK_NUMPAD4]) {
+				if (sm_res > 8) {
+					sm_res -= 8; sm_len = sm_res * sm_res;
+					screen_keys[VK_XBUTTON2] = 1;
+				}
+			}
+			if (screen_keys[VK_NUMPAD5]) {
+				if (sm_res < 1024) {
+					sm_res += 8; sm_len = sm_res * sm_res;
+					screen_keys[VK_XBUTTON2] = 1;
+				}
+			}
 			if (fabsf(alpha) > 1e-6) {
 				matrix_set_rotate(&m2, .5f, -1.f, 1.f, alpha);
 				matrix_mul(&device.transform.world, &device.transform.world, &m2);
 				alpha = 0.f;
+				screen_keys[VK_XBUTTON2] = 1;
 			}
 			cnt = 100;
 		}
 
 		update_camera(&device.transform.view, &eye, &up, &xaxis, &yaxis, &zaxis);
 		transform_update(&device.transform);
-		shadowmap_begin(&device);
-		draw_box(&device);
-		draw_knot(&device);
-		shadowmap_end(&device, states[indicator]);
+		if (screen_keys[VK_XBUTTON2] && device.render_state == RENDER_STATE_TEXTURE) {
+			shadowmap_begin(&device);
+			draw_box(&device);
+			draw_knot(&device);
+			shadowmap_end(&device, states[indicator]);
+			screen_keys[VK_XBUTTON2] = 0;
+		}
 
 		draw_box(&device);
 		draw_knot(&device);
