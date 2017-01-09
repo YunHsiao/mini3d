@@ -6,7 +6,7 @@ Features
 * One single C file
 * No dependencies
 * Left-handed coordinate system, WORLD / VIEW / PROJECTION model
-* CVV culling, backfacing culling
+* CVV culling, backfacing culling, near plane clipping
 * maximum 1024 x 1024 texture support
 * depth buffer
 * perspective-corrent texture mapping
