@@ -30,3 +30,11 @@
 
 # Debug files
 *.dSYM/
+Debug/
+Release/
+*.opendb
+*.db
+
+*.sln
+*.vcxproj
+*.filters
