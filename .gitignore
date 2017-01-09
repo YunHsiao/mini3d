@@ -32,6 +32,7 @@
 *.dSYM/
 Debug/
 Release/
+.vs/
 *.opendb
 *.db
 
